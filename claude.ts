@@ -1,13 +1,29 @@
-import { createInterface } from "node:readline/promises"
+import { execFile } from "node:child_process"
 import { existsSync } from "node:fs"
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises"
 import { dirname } from "node:path"
+import { createInterface } from "node:readline/promises"
 
 const BASE_URL = process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com"
 const API_KEY = process.env.ANTHROPIC_API_KEY
 const MODEL = process.env.MODEL ?? "claude-sonnet-5-5"
 
 if (!API_KEY) throw new Error("Set ANTHROPIC_API_KEY first")
+
+type Tool = {
+  name: string
+  description: string
+  parameters: Record<string, unknown> // JSON Schema, shared by both protocols
+  execute: (input: unknown) => Promise<string>
+  confirm?: (input: unknown) => string // describes the action; when set, the user must approve it first
+}
+
+// Reads one string field from model input, or throws a message that says how to fix it.
+const field = (input: unknown, key: string, example: string): string => {
+  const value = typeof input === "object" && input !== null ? (input as Record<string, unknown>)[key] : undefined
+  if (typeof value !== "string") throw new Error(`${key} must be a string, e.g. ${example}`)
+  return value
+}
 
 const listFiles = async (path: string) => {
   const entries = await readdir(path, { withFileTypes: true })
@@ -32,22 +48,30 @@ const editFile = async (path: string, oldStr: string, newStr: string) => {
   return "OK"
 }
 
-type ToolCall = { id: string; function: { name: string; arguments: string } }
-
-type Tool = {
-  name: string
-  description: string
-  parameters: Record<string, unknown> // JSON Schema
-  execute: (input: any) => Promise<string>
+const saveFile = async (path: string, content: string) => {
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, content)
+  return `Wrote ${content.length} characters to ${path}`
 }
 
-type TextBlock = { type: "text"; text: string }
-type ToolUseBlock = { type: "tool_use"; id: string; name: string; input: unknown }
-type Block = TextBlock | ToolUseBlock | { type: string } // e.g. thinking blocks: we pass them back untouched
-type ChatResponse = { content: Block[]; stop_reason: string }
+const TIMEOUT_MS = 30_000
+const MAX_OUTPUT = 10_000
 
-const isText = (block: Block): block is TextBlock => block.type === "text"
-const isToolUse = (block: Block): block is ToolUseBlock => block.type === "tool_use"
+const runBash = (command: string) =>
+  new Promise<string>((resolve, reject) => {
+    execFile("bash", ["-c", command], { timeout: TIMEOUT_MS, maxBuffer: 10_000_000 }, (error, stdout, stderr) => {
+      if (error?.killed) return reject(new Error(`The command ran longer than ${TIMEOUT_MS} ms and was stopped. Try a faster command.`))
+      if (error && typeof error.code !== "number") return reject(error)
+      const output = `${stdout}${stderr}`
+      const shown =
+        output.length > MAX_OUTPUT
+          ? `${output.slice(0, MAX_OUTPUT)}\n[Output truncated after ${MAX_OUTPUT} characters. Filter it with head, tail or grep.]`
+          : output
+      resolve(`Exit code: ${error ? error.code : 0}\n${shown}`)
+    })
+  })
+
+const rl = createInterface({ input: process.stdin, output: process.stdout })
 
 const tools: Tool[] = [
   {
@@ -59,7 +83,7 @@ const tools: Tool[] = [
       properties: { path: { type: "string", description: "Directory to list, e.g. '.' or 'notes'" } },
       required: ["path"],
     },
-    execute: ({ path }) => listFiles(path),
+    execute: (input) => listFiles(field(input, "path", "'.' or 'src'")),
   },
   {
     name: "read_file",
@@ -70,7 +94,7 @@ const tools: Tool[] = [
       properties: { path: { type: "string", description: "Path of the file to read, e.g. 'README.md'" } },
       required: ["path"],
     },
-    execute: ({ path }) => readFile(path, "utf8"),
+    execute: (input) => readFile(field(input, "path", "src/index.ts"), "utf8"),
   },
   {
     name: "edit_file",
@@ -85,9 +109,67 @@ const tools: Tool[] = [
       },
       required: ["path", "old_str", "new_str"],
     },
-    execute: ({ path, old_str, new_str }) => editFile(path, old_str, new_str),
+    execute: (input) =>
+      editFile(
+        field(input, "path", "src/index.ts"),
+        field(input, "old_str", "const a = 1 (or an empty string to create a file)"),
+        field(input, "new_str", "const a = 2"),
+      ),
+    confirm: (input) => `edit ${field(input, "path", "src/index.ts")}`,
+  },
+  {
+    name: "write_file",
+    description:
+      "Write a complete text file, replacing it if it already exists and creating missing folders. Use it to create a new file or to rewrite a file entirely. For a small change to an existing file, use edit_file instead, because it sends only the part that changes. The content you pass becomes the whole file.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path of the file to write, e.g. 'notes/plan.md'" },
+        content: { type: "string", description: "The full text of the file" },
+      },
+      required: ["path", "content"],
+    },
+    execute: (input) => saveFile(field(input, "path", "notes/plan.md"), field(input, "content", "the full text of the file")),
+    confirm: (input) => `write ${field(input, "path", "notes/plan.md")}`,
+  },
+  {
+    name: "bash",
+    description:
+      "Run a shell command with bash in the current directory and return its output and exit code. Use it for things the other tools cannot do, such as running a script, a test or git. Commands stop after 30 seconds and long output is cut off, so filter it with head, tail or grep when you expect a lot. Prefer read_file and list_files for reading, because they are cheaper and safer.",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string", description: "The command to run, e.g. 'ls -la' or 'bun test'" } },
+      required: ["command"],
+    },
+    execute: (input) => runBash(field(input, "command", "ls -la")),
+    confirm: (input) => `run: ${field(input, "command", "ls -la")}`,
   },
 ]
+
+type ToolResult = { content: string; isError: boolean }
+
+// Never throws: every failure becomes a result the model can read.
+const runTool = async (name: string, rawArguments: string): Promise<ToolResult> => {
+  try {
+    const tool = tools.find((tool) => tool.name === name)
+    if (!tool) throw new Error(`Unknown tool: ${name}. Available tools: ${tools.map((tool) => tool.name).join(", ")}`)
+
+    let input: unknown
+    try {
+      input = JSON.parse(rawArguments)
+    } catch {
+      throw new Error(`The arguments are not valid JSON: ${rawArguments}`)
+    }
+
+    if (tool.confirm) {
+      const answer = await rl.question(`Allow: ${tool.confirm(input)}? [y/N] `)
+      if (answer.trim().toLowerCase() !== "y") throw new Error("User declined this action. Ask what they would like instead.")
+    }
+    return { content: await tool.execute(input), isError: false }
+  } catch (error) {
+    return { content: error instanceof Error ? error.message : String(error), isError: true }
+  }
+}
 
 // The Anthropic protocol's wrapping of a tool. Same name and description, but the schema is called input_schema.
 const toAnthropicTool = (tool: Tool) => ({
@@ -95,6 +177,14 @@ const toAnthropicTool = (tool: Tool) => ({
   description: tool.description,
   input_schema: tool.parameters,
 })
+
+type TextBlock = { type: "text"; text: string }
+type ToolUseBlock = { type: "tool_use"; id: string; name: string; input: unknown }
+type Block = TextBlock | ToolUseBlock | { type: string } // e.g. thinking blocks: we pass them back untouched
+type ChatResponse = { content: Block[]; stop_reason: string }
+
+const isText = (block: Block): block is TextBlock => block.type === "text"
+const isToolUse = (block: Block): block is ToolUseBlock => block.type === "tool_use"
 
 const chat = async (messages: unknown[]): Promise<ChatResponse> => {
   const response = await fetch(`${BASE_URL}/v1/messages`, {
@@ -110,7 +200,6 @@ const chat = async (messages: unknown[]): Promise<ChatResponse> => {
   return (await response.json()) as ChatResponse
 }
 
-const rl = createInterface({ input: process.stdin, output: process.stdout })
 const messages: unknown[] = []
 
 while (true) {
@@ -131,10 +220,9 @@ while (true) {
     const results = []
     for (const call of calls) {
       console.log(`[tool] ${call.name}(${JSON.stringify(call.input)})`)
-      const tool = tools.find((tool) => tool.name === call.name)
-      if (!tool) throw new Error(`The model asked for an unknown tool: ${call.name}`)
-      const content = await tool.execute(call.input)
-      results.push({ type: "tool_result", tool_use_id: call.id, content })
+      const { content, isError } = await runTool(call.name, JSON.stringify(call.input))
+      if (isError) console.log(`[error] ${content}`)
+      results.push({ type: "tool_result", tool_use_id: call.id, content, is_error: isError })
     }
     messages.push({ role: "user", content: results })
   }
