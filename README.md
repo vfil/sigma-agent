@@ -16,7 +16,8 @@ You chat with it in the terminal. The model can't touch your files directly. It 
 
 ```
 You: <prompt>
-  └─► send full message history + tool definitions to the model
+  └─► the protocol encodes the full history + tool definitions, and sends them to the provider
+        the protocol decodes the reply into text and tool calls
         ├─ model replies with text         ─► print "Agent: ..."
         └─ model asks for tool call(s)     ─► for each one, print "[tool] name(args)", then:
               ├─ tool needs confirmation   ─► ask "Allow: ...? [y/N]"; anything but "y" declines
@@ -28,7 +29,12 @@ You: <prompt>
 
 Every failure (unknown tool, invalid JSON arguments, a missing or wrong-typed field, a declined confirmation, a command timeout, a missing file) is sent back to the model as an error result instead of crashing the program, so the model can read it and try something else.
 
-The whole conversation lives in memory (`messages`) and is lost when the process exits.
+The loop never sees a wire format. The conversation is a `history` of protocol-neutral messages made of text, tool-call and tool-result parts, and the active **protocol** encodes it for the wire and decodes the reply. Two details differ by protocol:
+
+- **OpenAI Chat Completions** has no error flag on tool results, so an error result is sent as text starting with `Error: `.
+- **Anthropic Messages** marks failures with `is_error`, and the loop keeps the provider's own reply content (thinking blocks included) so it can send it back unchanged.
+
+The whole conversation lives in memory (`history`) and is lost when the process exits.
 
 ## Adding a tool
 
@@ -44,18 +50,39 @@ A tool is a plain object in the `tools` array:
 }
 ```
 
-`runTool` looks the tool up, parses the arguments, asks for confirmation when `confirm` is set, runs `execute`, and turns any thrown error into an error result. `field()` reads a string argument and throws a message that tells the model how to fix it. The `tools` array and `runTool` are duplicated in both entry points, so add a new tool to both files.
+`runTool` looks the tool up, parses the arguments, asks for confirmation when `confirm` is set, runs `execute`, and turns any thrown error into an error result. `field()` reads a string argument and throws a message that tells the model how to fix it. Everything lives in [index.ts](index.ts), so a new tool is added in one place.
 
-## Two entry points
+## Providers
 
-Both files are the same agent loop with the same tools. They differ only in the wire protocol of the model provider.
+One agent loop, three **providers**. Pick one with the `PROVIDER` env var (default `ollama`):
 
-| File                 | Provider                                                | Config (env vars)                                                                              |
-| -------------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| [index.ts](index.ts)   | Any OpenAI-compatible server (local llama.cpp, Ollama…) | `BASE_URL` (default `http://127.0.0.1:9931/v1`), `MODEL` (default `qwen3.5:9b`)                |
-| [claude.ts](claude.ts) | Anthropic API                                           | `ANTHROPIC_API_KEY` (required), `ANTHROPIC_BASE_URL` (default `https://api.anthropic.com`), `MODEL` (default `claude-sonnet-5-5`) |
+| `PROVIDER`  | Talks to                       | Protocol                | Default base URL            | Default model       |
+| ----------- | ------------------------------ | ----------------------- | --------------------------- | ------------------- |
+| `ollama`    | Ollama                         | OpenAI Chat Completions | `http://127.0.0.1:11434/v1` | `qwen3.5:9b`        |
+| `llamacpp`  | llama.cpp server               | OpenAI Chat Completions | `http://127.0.0.1:9931/v1`  | `qwen3.5:9b`        |
+| `claude`    | Anthropic API                  | Anthropic Messages      | `https://api.anthropic.com` | `claude-sonnet-5-5` |
 
-`index.ts` is the main path. By default it expects a llama.cpp server on port `9931`. To use Ollama instead, set `BASE_URL=http://127.0.0.1:11434/v1`.
+```bash
+bun index.ts                                   # Ollama
+PROVIDER=llamacpp bun index.ts                 # llama.cpp on :9931
+PROVIDER=claude ANTHROPIC_API_KEY=... bun index.ts
+```
+
+Env vars:
+
+- `PROVIDER`: `ollama`, `llamacpp` or `claude`. Any other value stops the program with the list of valid ones.
+- `ANTHROPIC_API_KEY`: required when `PROVIDER=claude`, ignored otherwise.
+- `BASE_URL`, `MODEL`: override the chosen provider's defaults, whichever provider it is. `ANTHROPIC_BASE_URL` is no longer read; use `BASE_URL` to point `claude` at another endpoint.
+
+## Adding a provider
+
+A **route** binds a **protocol** to one provider's endpoint, headers and model. A server that speaks an existing protocol needs only a new entry in `routes`:
+
+```ts
+vllm: { protocol: openaiChat, baseUrl: "http://127.0.0.1:8000/v1", headers: {}, model: "my-model" },
+```
+
+A new wire format needs a new `Protocol` object with three members: `path` (the URL path to call), `body` (turns the history and tools into the request body) and `decode` (turns the response into a message and a finish reason: `tool-calls`, `stop` or `refusal`). Then reference it from a route.
 
 ## Setup
 
@@ -73,13 +100,16 @@ There are no automated tests. To check the agent works end to end, run it agains
 > **Warning:** the tools are not sandboxed. Paths are resolved against the directory you launch from and absolute paths work. `bash` can run any command as your user, and `edit_file` and `write_file` can create or overwrite any file you can write. The only protection is the confirmation prompt, so read the path or command it shows before typing `y`. Always run the agent from `playground/`, not from a directory you care about.
 
 1. Make sure a model is available:
-   - **`index.ts`**: start your OpenAI-compatible server (llama.cpp on `:9931` by default, or Ollama with `BASE_URL` set as above).
-   - **`claude.ts`**: `export ANTHROPIC_API_KEY=...`
+   - **`ollama`** (default): start Ollama and pull the model (`ollama pull qwen3.5:9b`).
+   - **`llamacpp`**: start your llama.cpp server on port `9931`.
+   - **`claude`**: `export ANTHROPIC_API_KEY=...`
 2. Start the agent from inside `playground/`:
 
    ```bash
    cd playground
-   bun ../index.ts      # or: bun ../claude.ts
+   bun ../index.ts                      # Ollama
+   PROVIDER=llamacpp bun ../index.ts    # llama.cpp
+   PROVIDER=claude bun ../index.ts      # Claude
    ```
 
 3. Ask it about the riddle. Example session:
@@ -120,7 +150,7 @@ Press `Ctrl+C` to quit.
 
 ## Repo layout
 
-- [index.ts](index.ts), [claude.ts](claude.ts): the agent (one file per provider)
+- [index.ts](index.ts): the whole agent (tools, agent loop, protocols and routes)
 - [GLOSSARY.md](GLOSSARY.md): the project's vocabulary
 - [playground/](playground/): scratch folder to run the agent in
 - `.claude/skills/`: Claude Code dev-workflow skills used when working on this repo. They are not part of the agent and you can ignore them.

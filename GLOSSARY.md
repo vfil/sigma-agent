@@ -19,3 +19,21 @@ _Avoid_: Response, tool output
 **Confirmation**:
 The step where the user must approve a gated tool call before it runs. Declining turns the call into an error result.
 _Avoid_: Permission prompt, approval, allow prompt
+
+## Talking to a model
+
+**Provider**:
+A model service the agent talks to, such as Ollama, llama.cpp or Claude.
+_Avoid_: Backend, vendor, model server
+
+**Protocol**:
+The wire format a provider speaks, which the agent translates its own conversation to and from.
+_Avoid_: API, format, adapter
+
+**Route**:
+A provider's endpoint, authentication and default model, bound to the protocol it speaks.
+_Avoid_: Config, endpoint
+
+**History**:
+The ordered conversation the agent sends to the model on every call.
+_Avoid_: Messages, context, transcript
