@@ -1,6 +1,6 @@
 # sigma-agent
 
-A minimal coding-agent in a single file, written to show how an LLM agent works without a framework.
+A small coding-agent in a handful of files, written to show how an LLM agent works. [Effect](https://effect.website) is the only dependency.
 
 You chat with it in the terminal. The model can't touch your files directly. It can only ask the program to run one of five **tools** (see [GLOSSARY.md](GLOSSARY.md) for the terms used here), and the program runs the tool and feeds the result back. Tools that change things ask you to confirm first.
 
@@ -22,12 +22,18 @@ You: <prompt>
         └─ model asks for tool call(s)     ─► for each one, print "[tool] name(args)", then:
               ├─ tool needs confirmation   ─► ask "Allow: ...? [y/N]"; anything but "y" declines
               ├─ run the tool              ─► result
-              └─ any failure               ─► print "[error] ...", and the error text becomes the result
+              └─ tool failure             ─► print "[error] ...", and the error text becomes the result
             append the results, call the model again
       (repeat until the model answers without a tool call, then wait for your next prompt)
 ```
 
-Every failure (unknown tool, invalid JSON arguments, a missing or wrong-typed field, a declined confirmation, a command timeout, a missing file) is sent back to the model as an error result instead of crashing the program, so the model can read it and try something else.
+One prompt and everything the agent does in answer to it is a **turn**. Failures are typed errors (see [src/errors.ts](src/errors.ts)), and the loop handles each kind in one place:
+
+- **Tool failures** (unknown tool, invalid arguments, a declined confirmation, a command timeout, a missing file) are sent back to the model as an error result, so it can read the message and try something else.
+- **Provider errors** (server unreachable, a non-OK status, an unreadable reply) are printed as `[provider error] ...` for you only. The model never sees them.
+- **Bugs** in the program are printed as `[bug] ...`.
+
+After a provider error or a bug the whole turn is dropped from the history and the prompt returns, so the next prompt starts from a consistent conversation.
 
 The loop never sees a wire format. The conversation is a `history` of protocol-neutral messages made of text, tool-call and tool-result parts, and the active **protocol** encodes it for the wire and decodes the reply. Two details differ by protocol:
 
@@ -38,19 +44,21 @@ The whole conversation lives in memory (`history`) and is lost when the process 
 
 ## Adding a tool
 
-A tool is a plain object in the `tools` array:
+A tool is built with `defineTool` and added to the `tools` array in [src/tools.ts](src/tools.ts):
 
 ```ts
-{
+defineTool({
   name: "word_count",
-  description: "Count the words in a text file.",          // the model reads this to decide when to use it
-  parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }, // JSON Schema
-  execute: async (input) => String((await readFile(field(input, "path", "notes.txt"), "utf8")).split(/\s+/).length),
-  confirm: (input) => `count words in ${field(input, "path", "notes.txt")}`, // optional: set it to require confirmation
-}
+  description: "Count the words in a text file.",   // the model reads this to decide when to use it
+  input: Schema.Struct({                            // one Schema: validates the input and becomes the JSON Schema the model receives
+    path: Schema.String.annotate({ description: "Path of the file to count, e.g. 'notes.txt'" }),
+  }),
+  execute: async ({ path }) => String((await readFile(path, "utf8")).split(/\s+/).length), // receives the validated, typed input
+  confirm: ({ path }) => `count words in ${path}`,  // optional: set it to require confirmation
+})
 ```
 
-`runTool` looks the tool up, parses the arguments, asks for confirmation when `confirm` is set, runs `execute`, and turns any thrown error into an error result. `field()` reads a string argument and throws a message that tells the model how to fix it. Everything lives in [index.ts](index.ts), so a new tool is added in one place.
+`runTool` (in [src/tool.ts](src/tool.ts)) looks the tool up and runs it. The tool checks the input against its `Schema`, asks for confirmation when `confirm` is set, then runs `execute`. Bad input becomes an `InvalidInput` error result that lists each problem and the fields the tool takes, and anything `execute` throws becomes an error result, so the model can read it and fix its call.
 
 ## Providers
 
@@ -63,9 +71,9 @@ One agent loop, three **providers**. Pick one with the `PROVIDER` env var (defau
 | `claude`    | Anthropic API                  | Anthropic Messages      | `https://api.anthropic.com` | `claude-sonnet-5-5` |
 
 ```bash
-bun index.ts                                   # Ollama
-PROVIDER=llamacpp bun index.ts                 # llama.cpp on :9931
-PROVIDER=claude ANTHROPIC_API_KEY=... bun index.ts
+bun src/index.ts                               # Ollama
+PROVIDER=llamacpp bun src/index.ts             # llama.cpp on :9931
+PROVIDER=claude ANTHROPIC_API_KEY=... bun src/index.ts
 ```
 
 Env vars:
@@ -76,13 +84,13 @@ Env vars:
 
 ## Adding a provider
 
-A **route** binds a **protocol** to one provider's endpoint, headers and model. A server that speaks an existing protocol needs only a new entry in `routes`:
+A **route** binds a **protocol** to one provider's endpoint, headers and model. A server that speaks an existing protocol needs only a new entry in `routes` in [src/provider.ts](src/provider.ts):
 
 ```ts
 vllm: { protocol: openaiChat, baseUrl: "http://127.0.0.1:8000/v1", headers: {}, model: "my-model" },
 ```
 
-A new wire format needs a new `Protocol` object with three members: `path` (the URL path to call), `body` (turns the history and tools into the request body) and `decode` (turns the response into a message and a finish reason: `tool-calls`, `stop` or `refusal`). Then reference it from a route.
+A new wire format needs a new `Protocol` object in [src/protocols.ts](src/protocols.ts) with three members: `path` (the URL path to call), `body` (turns the history and tools into the request body) and `decode` (turns the response into a message and a finish reason: `tool-calls`, `stop` or `refusal`). Then reference it from a route.
 
 ## Setup
 
@@ -107,9 +115,9 @@ There are no automated tests. To check the agent works end to end, run it agains
 
    ```bash
    cd playground
-   bun ../index.ts                      # Ollama
-   PROVIDER=llamacpp bun ../index.ts    # llama.cpp
-   PROVIDER=claude bun ../index.ts      # Claude
+   bun ../src/index.ts                      # Ollama
+   PROVIDER=llamacpp bun ../src/index.ts    # llama.cpp
+   PROVIDER=claude bun ../src/index.ts      # Claude
    ```
 
 3. Ask it about the riddle. Example session:
@@ -141,16 +149,24 @@ Allow: edit notes/todo.txt? [y/N]
 
 Type `y` to let it run. Anything else declines, and the model is told so and can ask what you'd like instead. Afterwards check `playground/notes/todo.txt` (use `git diff` to review and `git checkout playground` to undo).
 
-Press `Ctrl+C` to quit.
+Press `Ctrl+C` to quit. Ending the input with `Ctrl+D` also exits cleanly.
 
 ## Known limitations
 
 - No sandboxing, no streaming, no history persistence.
+- A turn that fails with a provider error or a bug is dropped from the history, including any tool calls it already ran. If the model had already edited a file or run a command before the failure, that change stays on disk but the model no longer remembers making it.
 - Confirmation covers only `edit_file`, `write_file` and `bash`. `read_file` and `list_files` can read any path without asking, and the prompt shows only the path or command, not the file content or a diff.
 
 ## Repo layout
 
-- [index.ts](index.ts): the whole agent (tools, agent loop, protocols and routes)
+- [src/index.ts](src/index.ts): the entry point: the history, the agent loop (one turn per prompt) and the top-level error handling
+- [src/messages.ts](src/messages.ts): the protocol-neutral message types
+- [src/tool.ts](src/tool.ts): `defineTool` and `runTool`
+- [src/tools.ts](src/tools.ts): the five tools
+- [src/protocols.ts](src/protocols.ts): the OpenAI Chat Completions and Anthropic Messages protocols
+- [src/provider.ts](src/provider.ts): the routes, provider selection from env vars, and the model call
+- [src/errors.ts](src/errors.ts): the typed errors
+- [src/terminal.ts](src/terminal.ts): reading a line from the user
 - [GLOSSARY.md](GLOSSARY.md): the project's vocabulary
 - [playground/](playground/): scratch folder to run the agent in
 - `.claude/skills/`: Claude Code dev-workflow skills used when working on this repo. They are not part of the agent and you can ignore them.

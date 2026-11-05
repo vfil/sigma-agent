@@ -1,6 +1,6 @@
 {
   "name": "sigma-agent",
-  "module": "index.ts",
+  "module": "src/index.ts",
   "type": "module",
   "private": true,
   "scripts": {
@@ -11,5 +11,8 @@
   },
   "peerDependencies": {
     "typescript": "^7"
+  },
+  "dependencies": {
+    "effect": "4.1.0"
   }
 }
