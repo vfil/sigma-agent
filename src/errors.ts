@@ -44,6 +44,15 @@ export class ProviderError extends Schema.TaggedError<ProviderError>()("Provider
   }
 }
 
+// The environment asks for a provider the agent cannot reach, such as an unknown PROVIDER or a missing API key.
+export class ConfigError extends Schema.TaggedError<ConfigError>()("ConfigError", {
+  reason: Schema.String,
+}) {
+  override get message() {
+    return this.reason
+  }
+}
+
 // Standard input ended, so there is nobody left to ask.
 export class InputClosed extends Schema.TaggedError<InputClosed>()("InputClosed", {}) {}
 

@@ -2,8 +2,8 @@ import { execFile } from "node:child_process"
 import { existsSync } from "node:fs"
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises"
 import { dirname } from "node:path"
-import { Schema } from "effect"
-import { defineTool, type Tool } from "./tool"
+import { Layer, Schema } from "effect"
+import { defineTool, Tools, type Tool } from "./tool"
 
 const listFiles = async (path: string) => {
   const entries = await readdir(path, { withFileTypes: true })
@@ -104,3 +104,5 @@ export const tools: Tool[] = [
     confirm: ({ command }) => `run: ${command}`,
   }),
 ]
+
+export const ToolsLive = Layer.succeed(Tools, tools)

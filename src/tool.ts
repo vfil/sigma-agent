@@ -1,7 +1,7 @@
-import { Effect, Schema, SchemaIssue } from "effect"
+import { Context, Effect, Schema, SchemaIssue } from "effect"
 import { Declined, InvalidInput, messageOf, ToolCrashed, UnknownTool } from "./errors"
 import type { ToolCallPart, ToolResultPart, ToolResultValue } from "./messages"
-import { ask } from "./terminal"
+import { Terminal } from "./terminal"
 
 export type ToolFailure = UnknownTool | InvalidInput | Declined | ToolCrashed
 
@@ -9,8 +9,11 @@ export type Tool = {
   name: string
   description: string
   parameters: Record<string, unknown> // JSON Schema, derived from the input Schema
-  run: (input: unknown) => Effect.Effect<string, ToolFailure>
+  run: (input: unknown) => Effect.Effect<string, ToolFailure, Terminal>
 }
+
+// The tools the agent knows, as a service. Which tools exist is decided where the layer is built.
+export class Tools extends Context.Service<Tools, Tool[]>()("@agent/Tools") {}
 
 const formatIssues = SchemaIssue.makeFormatterStandardSchemaV1()
 
@@ -50,7 +53,8 @@ export const defineTool = <S extends Schema.Struct<Schema.Struct.Fields> & { rea
 
         if (config.confirm) {
           // No answer counts as "no".
-          const answer = yield* ask(`Allow: ${config.confirm(input)}? [y/N] `).pipe(Effect.orElseSucceed(() => ""))
+          const terminal = yield* Terminal
+          const answer = yield* terminal.ask(`Allow: ${config.confirm(input)}? [y/N] `).pipe(Effect.orElseSucceed(() => ""))
           if (answer.trim().toLowerCase() !== "y") return yield* new Declined()
         }
 
@@ -63,13 +67,15 @@ export const defineTool = <S extends Schema.Struct<Schema.Struct.Fields> & { rea
 }
 
 // Cannot fail: every tool failure becomes a tool result the model can read.
-export const runTool = (tools: Tool[], call: ToolCallPart): Effect.Effect<ToolResultPart> => {
-  const done = (result: ToolResultValue): ToolResultPart => ({ type: "tool-result", id: call.id, name: call.name, result })
-  const tool = tools.find((tool) => tool.name === call.name)
-  const run = tool ? tool.run(call.input) : Effect.fail(new UnknownTool({ name: call.name, available: tools.map((tool) => tool.name) }))
+export const runTool = (call: ToolCallPart): Effect.Effect<ToolResultPart, never, Tools | Terminal> =>
+  Effect.gen(function* () {
+    const tools = yield* Tools
+    const done = (result: ToolResultValue): ToolResultPart => ({ type: "tool-result", id: call.id, name: call.name, result })
+    const tool = tools.find((tool) => tool.name === call.name)
+    const run = tool ? tool.run(call.input) : Effect.fail(new UnknownTool({ name: call.name, available: tools.map((tool) => tool.name) }))
 
-  return run.pipe(
-    Effect.map((value) => done({ type: "text", value })),
-    Effect.catch((failure) => Effect.succeed(done({ type: "error", value: failure.message }))),
-  )
-}
+    return yield* run.pipe(
+      Effect.map((value) => done({ type: "text", value })),
+      Effect.catch((failure) => Effect.succeed(done({ type: "error", value: failure.message }))),
+    )
+  })
