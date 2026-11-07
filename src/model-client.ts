@@ -1,15 +1,15 @@
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Layer, type Stream } from "effect"
 import type { ProviderError } from "./errors"
+import type { ModelEvent } from "./events"
 import type { Message } from "./messages"
 import { chat, selectRoute, type Route } from "./provider"
-import type { Reply } from "./protocols"
 import type { Tool } from "./tool"
 
 // What the agent needs from a model: one step. Which provider answers is not its business.
 export class ModelClient extends Context.Service<
   ModelClient,
   {
-    readonly chat: (history: Message[], tools: Tool[]) => Effect.Effect<Reply, ProviderError>
+    readonly chat: (history: Message[], tools: Tool[]) => Stream.Stream<ModelEvent, ProviderError>
   }
 >()("@agent/ModelClient") {}
 

@@ -2,7 +2,7 @@
 
 A small coding-agent in a handful of files, written to show how an LLM agent works. [Effect](https://effect.website) is the only dependency.
 
-You chat with it in the terminal. The model can't touch your files directly. It can only ask the program to run one of five **tools** (see [GLOSSARY.md](GLOSSARY.md) for the terms used here), and the program runs the tool and feeds the result back. Tools that change things ask you to confirm first.
+You chat with it in the terminal, and the reply appears as the model writes it. The model can't touch your files directly. It can only ask the program to run one of five **tools** (see [GLOSSARY.md](GLOSSARY.md) for the terms used here), and the program runs the tool and feeds the result back. Tools that change things ask you to confirm first.
 
 | Tool         | What it does                                                                                              | Confirms first? |
 | ------------ | --------------------------------------------------------------------------------------------------------- | --------------- |
@@ -16,9 +16,9 @@ You chat with it in the terminal. The model can't touch your files directly. It 
 
 ```
 You: <prompt>
-  └─► the protocol encodes the full history + tool definitions, and sends them to the provider
-        the protocol decodes the reply into text and tool calls
-        ├─ model replies with text         ─► print "Agent: ..."
+  └─► the protocol encodes the full history + tool definitions, and sends them to the provider, asking for a stream
+        the protocol decodes the stream into events: pieces of text, finished tool calls, and a final "finish"
+        ├─ text pieces                     ─► print "Agent: ..." piece by piece as they arrive
         └─ model asks for tool call(s)     ─► for each one, print "[tool] name(args)", then:
               ├─ tool needs confirmation   ─► ask "Allow: ...? [y/N]"; anything but "y" declines
               ├─ run the tool              ─► result
@@ -30,21 +30,34 @@ You: <prompt>
 One prompt and everything the agent does in answer to it is a **turn**. Failures are typed errors (see [src/errors.ts](src/errors.ts)), and the loop handles each kind in one place:
 
 - **Tool failures** (unknown tool, invalid arguments, a declined confirmation, a command timeout, a missing file) are sent back to the model as an error result, so it can read the message and try something else.
-- **Provider errors** (server unreachable, a non-OK status, an unreadable reply) are printed as `[provider error] ...` for you only. The model never sees them.
+- **Provider errors** (server unreachable, a non-OK status, a stream that breaks off, ends before the model finished, or can't be read) are printed as `[provider error] ...` for you only. The model never sees them.
 - **Bugs** in the program are printed as `[bug] ...`.
+- **Config errors** (an unknown `PROVIDER`, a missing `ANTHROPIC_API_KEY`) are raised when the model client is built, before the first prompt. The program prints the message and exits with code 1.
 
-After a provider error or a bug the whole turn is dropped from the history and the prompt returns, so the next prompt starts from a consistent conversation.
+After a provider error or a bug the whole turn is dropped from the history and the prompt returns, so the next prompt starts from a consistent conversation. If the error hits in the middle of a reply, the text already printed stays on screen, the line is ended, and then the error is printed.
 
-The loop never sees a wire format. The conversation is a `history` of protocol-neutral messages made of text, tool-call and tool-result parts, and the active **protocol** encodes it for the wire and decodes the reply. Two details differ by protocol:
+The loop never sees a wire format. The conversation is a `history` of protocol-neutral messages made of text, tool-call and tool-result parts, and the active **protocol** encodes it for the wire and decodes the reply. A reply comes back as server-sent events ([src/sse.ts](src/sse.ts) cuts the bytes into frames), and the protocol turns the frames into **model events** ([src/events.ts](src/events.ts)): `text-delta`, `tool-call` (sent once its arguments are complete) and `finish` (with the reason `tool-calls`, `stop` or `refusal`). The loop builds the assistant message from those events. Two details differ by protocol:
 
 - **OpenAI Chat Completions** has no error flag on tool results, so an error result is sent as text starting with `Error: `.
-- **Anthropic Messages** marks failures with `is_error`, and the loop keeps the provider's own reply content (thinking blocks included) so it can send it back unchanged.
+- **Anthropic Messages** marks failures with `is_error`, and the `finish` event carries the provider's own reply content (thinking blocks included) so the loop can send it back unchanged.
 
 The whole conversation lives in memory (`history`) and is lost when the process exits.
 
+## Services and layers
+
+The loop in [src/agent.ts](src/agent.ts) does not import readline, `fetch` or the tool list. It asks for three **services** (Effect `Context.Service`s), and [src/index.ts](src/index.ts) wires the real ones in as **layers**:
+
+| Service       | What the loop needs from it                                | Real layer        | Defined in                                 |
+| ------------- | ---------------------------------------------------------- | ----------------- | ------------------------------------------ |
+| `ModelClient` | `chat(history, tools)`: one model call, as a stream of events | `ModelClientLive` | [src/model-client.ts](src/model-client.ts) |
+| `Terminal`    | `ask(prompt)` to read a line, `say(line)` to print one, `write(text)` to print without ending the line | `TerminalLive`    | [src/terminal.ts](src/terminal.ts)         |
+| `Tools`       | the list of tools the model may call                       | `ToolsLive`       | [src/tools.ts](src/tools.ts)               |
+
+Building `ModelClientLive` reads the environment, so provider selection happens once at startup instead of at import time. `TerminalLive` opens readline and closes it when the program ends. Because the loop only sees the services, a test can swap in fakes without touching the network, the keyboard or the disk.
+
 ## Adding a tool
 
-A tool is built with `defineTool` and added to the `tools` array in [src/tools.ts](src/tools.ts):
+A tool is built with `defineTool` and added to the `tools` array in [src/tools.ts](src/tools.ts), which `ToolsLive` provides to the loop:
 
 ```ts
 defineTool({
@@ -58,7 +71,7 @@ defineTool({
 })
 ```
 
-`runTool` (in [src/tool.ts](src/tool.ts)) looks the tool up and runs it. The tool checks the input against its `Schema`, asks for confirmation when `confirm` is set, then runs `execute`. Bad input becomes an `InvalidInput` error result that lists each problem and the fields the tool takes, and anything `execute` throws becomes an error result, so the model can read it and fix its call.
+`runTool` (in [src/tool.ts](src/tool.ts)) takes the tool list from the `Tools` service, looks the tool up and runs it. The tool checks the input against its `Schema`, asks for confirmation through the `Terminal` service when `confirm` is set, then runs `execute`. Bad input becomes an `InvalidInput` error result that lists each problem and the fields the tool takes, and anything `execute` throws becomes an error result, so the model can read it and fix its call.
 
 ## Providers
 
@@ -84,13 +97,13 @@ Env vars:
 
 ## Adding a provider
 
-A **route** binds a **protocol** to one provider's endpoint, headers and model. A server that speaks an existing protocol needs only a new entry in `routes` in [src/provider.ts](src/provider.ts):
+A **route** binds a **protocol** to one provider's endpoint, headers and model. A server that speaks an existing protocol needs only a new entry in `routes` in [src/provider.ts](src/provider.ts). `routes` is a function of the environment, so the entry goes inside the object it returns:
 
 ```ts
 vllm: { protocol: openaiChat, baseUrl: "http://127.0.0.1:8000/v1", headers: {}, model: "my-model" },
 ```
 
-A new wire format needs a new `Protocol` object in [src/protocols.ts](src/protocols.ts) with three members: `path` (the URL path to call), `body` (turns the history and tools into the request body) and `decode` (turns the response into a message and a finish reason: `tool-calls`, `stop` or `refusal`). Then reference it from a route.
+A new wire format needs a new `Protocol` object in [src/protocols.ts](src/protocols.ts) with three members: `path` (the URL path to call), `body` (turns the history and tools into the request body, with streaming turned on) and `events` (turns the stream of server-sent frames into model events: `text-delta`, `tool-call` and a last `finish` with the reason `tool-calls`, `stop` or `refusal`). Then reference it from a route.
 
 ## Setup
 
@@ -99,11 +112,27 @@ Requires [Bun](https://bun.com). The project uses Bun for everything (see [CLAUD
 ```bash
 bun install
 bun check        # type check (same as `bun run typecheck`)
+bun test         # run the automated tests (same as `bun run test`)
 ```
+
+## Tests
+
+`bun test` runs without a network, a keyboard or a real model. There are three groups:
+
+- [test/agent.test.ts](test/agent.test.ts) runs the agent loop against a scripted model and a scripted terminal, with two small in-memory tools. The fakes live in [test/fakes.ts](test/fakes.ts) and are provided as layers in place of the real services. It covers:
+  - a tool call followed by a final answer
+  - a declined confirmation reaching the model as an error result
+  - a turn whose model call fails being dropped from the history
+  - a reply shown piece by piece
+  - a reply that breaks off: the line is ended and the turn is dropped
+- [test/protocols.test.ts](test/protocols.test.ts) feeds recorded streams from [test/fixtures/](test/fixtures/) (Ollama, llama.cpp and Claude) through the framing and each protocol. It checks the events, that a tool call sent in fragments comes out as one `tool-call` event, and that the result does not depend on where the bytes are cut.
+- [test/provider.test.ts](test/provider.test.ts) runs one step against a small local HTTP server: the request asks for a stream, and a stream that stops early, a frame that isn't JSON, an error status and an unreachable server each fail with a `ProviderError`.
+
+They do not cover a real model or the built-in tools.
 
 ## Try it (manual smoke test)
 
-There are no automated tests. To check the agent works end to end, run it against the [playground/](playground/) folder, which contains a riddle in `secret-file.txt`.
+The tests do not exercise a real model. To check the agent works end to end, run it against the [playground/](playground/) folder, which contains a riddle in `secret-file.txt`.
 
 > **Warning:** the tools are not sandboxed. Paths are resolved against the directory you launch from and absolute paths work. `bash` can run any command as your user, and `edit_file` and `write_file` can create or overwrite any file you can write. The only protection is the confirmation prompt, so read the path or command it shows before typing `y`. Always run the agent from `playground/`, not from a directory you care about.
 
@@ -153,20 +182,25 @@ Press `Ctrl+C` to quit. Ending the input with `Ctrl+D` also exits cleanly.
 
 ## Known limitations
 
-- No sandboxing, no streaming, no history persistence.
+- No sandboxing, no history persistence.
 - A turn that fails with a provider error or a bug is dropped from the history, including any tool calls it already ran. If the model had already edited a file or run a command before the failure, that change stays on disk but the model no longer remembers making it.
 - Confirmation covers only `edit_file`, `write_file` and `bash`. `read_file` and `list_files` can read any path without asking, and the prompt shows only the path or command, not the file content or a diff.
 
 ## Repo layout
 
-- [src/index.ts](src/index.ts): the entry point: the history, the agent loop (one turn per prompt) and the top-level error handling
+- [src/index.ts](src/index.ts): the entry point: wires the live layers together, runs the loop and reports config errors
+- [src/agent.ts](src/agent.ts): the agent loop (`turn`, one per prompt; `step`, one model call, which prints the text as it arrives and builds the assistant message) and the `repl` that reads prompts and handles provider errors and bugs
+- [src/events.ts](src/events.ts): the model events a step streams
+- [src/sse.ts](src/sse.ts): cuts a byte stream into server-sent events
+- [src/model-client.ts](src/model-client.ts): the `ModelClient` service and its live layer
 - [src/messages.ts](src/messages.ts): the protocol-neutral message types
-- [src/tool.ts](src/tool.ts): `defineTool` and `runTool`
-- [src/tools.ts](src/tools.ts): the five tools
-- [src/protocols.ts](src/protocols.ts): the OpenAI Chat Completions and Anthropic Messages protocols
-- [src/provider.ts](src/provider.ts): the routes, provider selection from env vars, and the model call
+- [src/tool.ts](src/tool.ts): `defineTool`, `runTool` and the `Tools` service
+- [src/tools.ts](src/tools.ts): the five tools and `ToolsLive`
+- [src/protocols.ts](src/protocols.ts): the OpenAI Chat Completions and Anthropic Messages protocols, each turning stream frames into model events
+- [src/provider.ts](src/provider.ts): the routes, provider selection from env vars (`selectRoute`), and the model call (a stream of events; it fails if the stream ends before a `finish`)
 - [src/errors.ts](src/errors.ts): the typed errors
-- [src/terminal.ts](src/terminal.ts): reading a line from the user
+- [src/terminal.ts](src/terminal.ts): the `Terminal` service (read a line, print a line, print without ending the line) and its live layer
+- [test/](test/): the loop, protocol and provider tests, the fake model and terminal, and recorded streams in `fixtures/`
 - [GLOSSARY.md](GLOSSARY.md): the project's vocabulary
 - [playground/](playground/): scratch folder to run the agent in
 - `.claude/skills/`: Claude Code dev-workflow skills used when working on this repo. They are not part of the agent and you can ignore them.

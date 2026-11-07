@@ -9,6 +9,8 @@ export class Terminal extends Context.Service<
     // Asks one question. The type says it can fail: input may have ended.
     readonly ask: (prompt: string) => Effect.Effect<string, InputClosed>
     readonly say: (line: string) => Effect.Effect<void>
+    // Prints text without ending the line, so a reply can appear piece by piece.
+    readonly write: (text: string) => Effect.Effect<void>
   }
 >()("@agent/Terminal") {}
 
@@ -32,6 +34,7 @@ export const TerminalLive = Layer.effect(
           catch: () => new InputClosed(),
         }),
       say: (line) => Effect.sync(() => console.log(line)),
+      write: (text) => Effect.sync(() => void process.stdout.write(text)),
     })
   }),
 )

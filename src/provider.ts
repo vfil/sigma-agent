@@ -1,7 +1,9 @@
-import { Effect } from "effect"
+import { Effect, Stream } from "effect"
 import { ConfigError, messageOf, ProviderError } from "./errors"
+import type { ModelEvent } from "./events"
 import type { Message } from "./messages"
-import { anthropicMessages, openaiChat, type Protocol, type Reply } from "./protocols"
+import { anthropicMessages, openaiChat, type Protocol } from "./protocols"
+import { frames } from "./sse"
 import type { Tool } from "./tool"
 
 type Env = Record<string, string | undefined>
@@ -30,25 +32,50 @@ export const selectRoute = (env: Env): Effect.Effect<Route, ConfigError> => {
   return Effect.succeed({ ...selected, baseUrl: env.BASE_URL ?? selected.baseUrl, model: env.MODEL ?? selected.model })
 }
 
-// One step: one model call. It fails with a ProviderError that the user reads; the model never sees it.
-export const chat = (route: Route, history: Message[], tools: Tool[]) =>
-  Effect.gen(function* () {
-    const unreachable = (error: unknown) => new ProviderError({ reason: `Could not reach ${route.baseUrl}: ${messageOf(error)}` })
-
-    const response = yield* Effect.tryPromise({
-      try: () =>
-        fetch(`${route.baseUrl}${route.protocol.path}`, {
-          method: "POST",
-          headers: { "content-type": "application/json", ...route.headers },
-          body: JSON.stringify(route.protocol.body(route.model, history, tools)),
+// A stream that ends without a finish event was cut off.
+const requireFinish = (route: Route) => (events: Stream.Stream<ModelEvent, ProviderError>) =>
+  Stream.suspend(() => {
+    let finished = false
+    return events.pipe(
+      Stream.tap((event) =>
+        Effect.sync(() => {
+          if (event.type === "finish") finished = true
         }),
-      catch: unreachable
-    })
-    const text = yield* Effect.tryPromise({ try: () => response.text(), catch: unreachable })
-    if (!response.ok) return yield* new ProviderError({ reason: `${route.baseUrl} answered ${response.status}: ${text}` })
-
-    return yield* Effect.try({
-      try: (): Reply => route.protocol.decode(JSON.parse(text)),
-      catch: (error) => new ProviderError({ reason: `Could not read the reply from ${route.baseUrl}: ${messageOf(error)}` })
-    })
+      ),
+      Stream.onEnd(
+        Effect.suspend(() =>
+          finished ? Effect.void : Effect.fail(new ProviderError({ reason: `The stream from ${route.baseUrl} ended before the model finished` })),
+        ),
+      ),
+    )
   })
+
+// One step: one model call, as a stream of events. It fails with a ProviderError that the user reads; the model never sees it.
+export const chat = (route: Route, history: Message[], tools: Tool[]): Stream.Stream<ModelEvent, ProviderError> =>
+  Stream.unwrap(
+    Effect.gen(function* () {
+      const unreachable = (error: unknown) => new ProviderError({ reason: `Could not reach ${route.baseUrl}: ${messageOf(error)}` })
+
+      const response = yield* Effect.tryPromise({
+        try: () =>
+          fetch(`${route.baseUrl}${route.protocol.path}`, {
+            method: "POST",
+            headers: { "content-type": "application/json", ...route.headers },
+            body: JSON.stringify(route.protocol.body(route.model, history, tools)),
+          }),
+        catch: unreachable,
+      })
+      const body = response.body
+      if (!response.ok || !body) {
+        const text = yield* Effect.tryPromise({ try: () => response.text(), catch: unreachable })
+        return yield* new ProviderError({ reason: `${route.baseUrl} answered ${response.status}: ${text}` })
+      }
+
+      // From here on, the answer is still being written. A failure now happens in the middle of a reply.
+      const bytes = Stream.fromReadableStream({
+        evaluate: () => body,
+        onError: (error) => new ProviderError({ reason: `The stream from ${route.baseUrl} broke off: ${messageOf(error)}` }),
+      })
+      return route.protocol.events(frames(bytes)).pipe(requireFinish(route))
+    }),
+  )

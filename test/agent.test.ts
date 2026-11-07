@@ -4,7 +4,7 @@ import { repl } from "../src/agent"
 import { ProviderError } from "../src/errors"
 import type { Message } from "../src/messages"
 import { defineTool, Tools } from "../src/tool"
-import { callTool, reply, scriptedModel, scriptedTerminal, type Step } from "./fakes"
+import { callTool, fail, reply, scriptedModel, scriptedTerminal, type Step } from "./fakes"
 
 // Two small tools, so the tests never touch the disk.
 const echo = defineTool({
@@ -30,7 +30,8 @@ const run = async (script: { model: Step[]; answers: string[] }) => {
   const layers = Layer.mergeAll(model.layer, terminal.layer, Layer.succeed(Tools, [echo, deleteEverything]))
 
   await Effect.runPromise(repl(history).pipe(Effect.provide(layers)))
-  return { history, requests: model.requests, output: terminal.output }
+  return { history, requests: model.requests, output: terminal.output, writes: terminal.writes }
+
 }
 
 describe("the agent loop", () => {
@@ -59,11 +60,28 @@ describe("the agent loop", () => {
 
   test("drops a turn whose model call fails", async () => {
     const { history, output } = await run({
-      model: [new ProviderError({ reason: "connection refused" })],
+      model: [fail("connection refused")],
       answers: ["hello"],
     })
 
     expect(history).toEqual([])
     expect(output).toContain("[provider error] connection refused")
+  })
+
+  test("shows the reply piece by piece", async () => {
+    const { writes } = await run({ model: [reply("Hello there, friend.")], answers: ["hi"] })
+
+    expect(writes).toEqual(["Agent: ", "Hello ", "there, ", "friend."])
+  })
+
+  test("ends the line of a reply that breaks off, then drops the turn", async () => {
+    const { history, output } = await run({
+      model: [[{ type: "text-delta", text: "The answer is" }, new ProviderError({ reason: "connection reset" })]],
+      answers: ["hello"],
+    })
+
+    expect(history).toEqual([])
+    expect(output).toContain("Agent: The answer is")
+    expect(output).toContain("[provider error] connection reset")
   })
 })
