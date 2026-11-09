@@ -5,10 +5,13 @@
   "private": true,
   "scripts": {
     "typecheck": "bun check",
-    "test": "bun test"
+    "test": "bun test",
+    "prepare": "effect-tsgo patch --typescript --no-oxlint"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "typescript": "7.0.2",
+    "@effect/tsgo": "0.67.5"
   },
   "peerDependencies": {
     "typescript": "^7"
