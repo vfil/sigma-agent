@@ -1,6 +1,9 @@
 # dependencies (bun install)
 node_modules
 
+# local sqlite db files
+my-agent.db*
+
 # output
 out
 dist

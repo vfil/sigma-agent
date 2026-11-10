@@ -53,6 +53,17 @@ export class ConfigError extends Schema.TaggedError<ConfigError>()("ConfigError"
   }
 }
 
+// A stored session event that no longer matches the schema, such as a file edited by hand or written by an older version.
+export class SessionCorrupt extends Schema.TaggedError<SessionCorrupt>()("SessionCorrupt", {
+  session: Schema.String,
+  seq: Schema.Number,
+  problem: Schema.String,
+}) {
+  override get message() {
+    return `Session ${this.session} cannot be read: event ${this.seq} ${this.problem}`
+  }
+}
+
 // Standard input ended, so there is nobody left to ask.
 export class InputClosed extends Schema.TaggedError<InputClosed>()("InputClosed", {}) {}
 

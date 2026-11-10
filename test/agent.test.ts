@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Effect, Layer, Schema } from "effect"
 import { repl } from "../src/agent"
 import { ProviderError } from "../src/errors"
-import type { Message } from "../src/messages"
+import { Session, SessionLive } from "../src/session"
 import { defineTool, Tools } from "../src/tool"
 import { callTool, fail, reply, scriptedModel, scriptedTerminal, type Step } from "./fakes"
 
@@ -22,16 +22,20 @@ const deleteEverything = defineTool({
   confirm: () => "delete everything",
 })
 
-// Runs the loop against a script and returns what the loop and the fakes saw.
+// Runs the loop against a script, on a session kept in memory, and returns what the loop and the fakes saw.
 const run = async (script: { model: Step[]; answers: string[] }) => {
   const model = scriptedModel(script.model)
   const terminal = scriptedTerminal(script.answers)
-  const history: Message[] = []
-  const layers = Layer.mergeAll(model.layer, terminal.layer, Layer.succeed(Tools, [echo, deleteEverything]))
+  const layers = Layer.mergeAll(model.layer, terminal.layer, Layer.succeed(Tools, [echo, deleteEverything]), SessionLive({ path: ":memory:", id: "test" }))
 
-  await Effect.runPromise(repl(history).pipe(Effect.provide(layers)))
-  return { history, requests: model.requests, output: terminal.output, writes: terminal.writes }
-
+  const { history, events } = await Effect.runPromise(
+    Effect.gen(function* () {
+      yield* repl
+      const session = yield* Session
+      return { history: yield* session.history, events: yield* session.events }
+    }).pipe(Effect.provide(layers)),
+  )
+  return { history, events, requests: model.requests, output: terminal.output, writes: terminal.writes }
 }
 
 describe("the agent loop", () => {
@@ -75,13 +79,23 @@ describe("the agent loop", () => {
   })
 
   test("ends the line of a reply that breaks off, then drops the turn", async () => {
-    const { history, output } = await run({
+    const { history, events, output } = await run({
       model: [[{ type: "text-delta", text: "The answer is" }, new ProviderError({ reason: "connection reset" })]],
       answers: ["hello"],
     })
 
     expect(history).toEqual([])
+    expect(events.map((event) => event.type)).toEqual(["prompt", "turn-failed"])
     expect(output).toContain("Agent: The answer is")
     expect(output).toContain("[provider error] connection reset")
+  })
+
+  test("appends each fact to the log as it happens", async () => {
+    const { events } = await run({
+      model: [callTool("call_1", "echo", { text: "hi" }), reply("The tool said hi.")],
+      answers: ["say hi"],
+    })
+
+    expect(events.map((event) => event.type)).toEqual(["prompt", "step-finished", "tool-result", "step-finished"])
   })
 })

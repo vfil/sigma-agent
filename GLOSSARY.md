@@ -47,5 +47,27 @@ One user prompt and everything the agent does in answer to it, from the first mo
 _Avoid_: Step, iteration, request
 
 **History**:
-The ordered conversation the agent sends to the model on every call.
+The ordered conversation the agent sends to the model on every call, rebuilt from the session's events and leaving out any failed turn.
 _Avoid_: Messages, context, transcript
+
+## Sessions
+
+**Session**:
+A named conversation that survives restarts. It is identified by a session id, and starting the agent with the same id continues it.
+_Avoid_: Chat, conversation, save file
+
+**Session event**:
+One recorded fact in a session: a prompt, a finished step, a tool result or a failed turn. Always written in full, never just "event", which would be confused with a model event.
+_Avoid_: Event log, log entry, record
+
+**Model event**:
+One piece of a model's streamed reply: a piece of text, a finished tool call, or the finish of the reply. It is not recorded in the session; only the finished message is.
+_Avoid_: Chunk, delta, stream event
+
+**Resume**:
+On startup, finishing a turn that a previous run left unfinished.
+_Avoid_: Recover, replay, restore
+
+**Interrupted tool call**:
+A tool call that has no recorded result when a session resumes. It is never run again: it gets an error result saying it may or may not have run.
+_Avoid_: Pending call, orphaned call

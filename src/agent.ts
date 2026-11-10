@@ -1,21 +1,26 @@
 import { Effect, Stream } from "effect"
-import { messageOf } from "./errors"
+import { messageOf, type InputClosed, type ProviderError, type SessionCorrupt } from "./errors"
 import type { FinishReason } from "./events"
-import { isToolCall, type Message, type Part, type ToolResultPart } from "./messages"
+import { unansweredCalls } from "./history"
+import { isToolCall, type Message, type Part } from "./messages"
 import { ModelClient } from "./model-client"
+import { Session } from "./session"
 import { Terminal } from "./terminal"
 import { runTool, Tools, type Tool } from "./tool"
 
-// One step: stream the model's events, show the text as it arrives, and build the assistant message from them.
-const step = (history: Message[], tools: Tool[]) =>
+// One step: reload the history from the log, stream the model's events, show the text as it arrives,
+// and append the finished message to the log.
+const step = (tools: Tool[]) =>
   Effect.gen(function* () {
     const model = yield* ModelClient
     const terminal = yield* Terminal
+    const session = yield* Session
+    const history = yield* session.history
     const content: Part[] = []
     let text = "" // the text block being written, if any
     const outcome: { finish: FinishReason; native?: unknown } = { finish: "stop" }
 
-    // A text block ends when anything else arrives, or when the stream does.
+    // A text block ends when anything else arrives, or when the stream does, even by failing.
     const endText = Effect.suspend(() => {
       if (!text) return Effect.void
       content.push({ type: "text", text })
@@ -37,54 +42,81 @@ const step = (history: Message[], tools: Tool[]) =>
           outcome.finish = event.reason
           outcome.native = event.native
         }
-      })
+      }),
     ).pipe(Effect.ensuring(endText))
 
     const message: Message = { role: "assistant", content, ...(outcome.native === undefined ? {} : { native: outcome.native }) }
+    yield* session.append({ type: "step-finished", message, finish: outcome.finish })
     return { message, finish: outcome.finish }
   })
 
-// One prompt: call the model until it stops asking for tools.
-export const turn = (history: Message[], input: string) =>
-  Effect.gen(function* () {
-    const terminal = yield* Terminal
-    const tools = yield* Tools
-    history.push({ role: "user", content: [{ type: "text", text: input }] })
+// Steps until the model stops asking for tools. Each result is appended as soon as its tool finishes.
+const run = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+  const tools = yield* Tools
 
-    while (true) {
-      const { message, finish } = yield* step(history, tools)
-      history.push(message)
-      if (finish !== "tool-calls") return
+  while (true) {
+    const { message, finish } = yield* step(tools)
+    if (finish !== "tool-calls") return
 
-      const results: ToolResultPart[] = []
-      for (const call of message.content.filter(isToolCall)) {
-        yield* terminal.say(`[tool] ${call.name}(${JSON.stringify(call.input)})`)
-        const result = yield* runTool(call)
-        if (result.result.type === "error") yield* terminal.say(`[error] ${result.result.value}`)
-        results.push(result)
-      }
-      history.push({ role: "tool", content: results })
+    for (const call of message.content.filter(isToolCall)) {
+      yield* terminal.say(`[tool] ${call.name}(${JSON.stringify(call.input)})`)
+      const part = yield* runTool(call)
+      if (part.result.type === "error") yield* terminal.say(`[error] ${part.result.value}`)
+      yield* session.append({ type: "tool-result", part })
     }
+  }
+})
+
+// One prompt: record it, then run steps until the turn is over.
+export const turn = (input: string) =>
+  Effect.gen(function* () {
+    const session = yield* Session
+    yield* session.append({ type: "prompt", text: input })
+    yield* run
   })
 
-// The read-eval-print loop: read a line from the user, run a turn on it, print the output, and repeat.
-export const repl = (history: Message[]) =>
-  Effect.gen(function* () {
-    const terminal = yield* Terminal
-    while (true) {
-      const input = yield* terminal.ask("You: ")
+const interrupted =
+  "The agent stopped before this tool finished, so it may or may not have run. Check the current state before repeating it."
 
-      // A turn that fails is dropped from the history, so the next prompt starts from a consistent conversation.
-      const before = history.length
-      const drop = (label: string, reason: string) =>
-        Effect.suspend(() => {
-          history.length = before
-          return terminal.say(`[${label}] ${reason}`)
-        })
+// A restart can find a turn that did not finish. Tool calls without a result get an error result instead of
+// running again, since a command that already ran must not run twice. Then the turn continues.
+const resume = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+  const calls = unansweredCalls(yield* session.history)
+  if (calls === undefined) return
 
-      yield* turn(history, input).pipe(
-        Effect.catchTag("ProviderError", (error) => drop("provider error", error.message)),
-        Effect.catchDefect((defect) => drop("bug", messageOf(defect))),
-      )
-    }
-  }).pipe(Effect.catchTag("InputClosed", () => Effect.void))
+  yield* terminal.say(`[resuming session ${session.id}]`)
+  for (const call of calls) {
+    yield* terminal.say(`[interrupted] ${call.name}(${JSON.stringify(call.input)})`)
+    yield* session.append({
+      type: "tool-result",
+      part: { type: "tool-result", id: call.id, name: call.name, result: { type: "error", value: interrupted } },
+    })
+  }
+  yield* run
+})
+
+// The read-eval-print loop: finish an interrupted turn, then read a line from the user, run a turn on it,
+// print the output, and repeat.
+export const repl = Effect.gen(function* () {
+  const terminal = yield* Terminal
+  const session = yield* Session
+
+  // A turn that fails is recorded as failed, so the next prompt starts from a consistent history.
+  const failed = (label: string, reason: string) =>
+    session.append({ type: "turn-failed", reason }).pipe(Effect.andThen(terminal.say(`[${label}] ${reason}`)))
+  const guarded = <R>(work: Effect.Effect<void, ProviderError | SessionCorrupt | InputClosed, R>) =>
+    work.pipe(
+      Effect.catchTag("ProviderError", (error) => failed("provider error", error.message)),
+      Effect.catchDefect((defect) => failed("bug", messageOf(defect))),
+    )
+
+  yield* guarded(resume)
+  while (true) {
+    const input = yield* terminal.ask("You: ")
+    yield* guarded(turn(input))
+  }
+}).pipe(Effect.catchTag("InputClosed", () => Effect.void))

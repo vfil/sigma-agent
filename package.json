@@ -6,17 +6,21 @@
   "scripts": {
     "typecheck": "bun check",
     "test": "bun test",
-    "prepare": "effect-tsgo patch --typescript --no-oxlint"
+    "prepare": "effect-tsgo patch --typescript --no-oxlint",
+    "db:generate": "drizzle-kit generate"
   },
   "devDependencies": {
+    "@effect/tsgo": "0.67.5",
     "@types/bun": "latest",
-    "typescript": "7.0.2",
-    "@effect/tsgo": "0.67.5"
+    "drizzle-kit": "1.0.0-rc.5",
+    "typescript": "7.0.2"
   },
   "peerDependencies": {
     "typescript": "^7"
   },
   "dependencies": {
+    "@effect/sql-sqlite-bun": "4.1.0",
+    "drizzle-orm": "1.0.0-rc.5",
     "effect": "4.1.0"
   }
 }
