@@ -1,0 +1,108 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "id": "4a117477-5486-4a53-b43d-9be29195c8da",
+  "prevIds": [
+    "1e5cd947-7667-481e-85cc-a94d01467639"
+  ],
+  "ddl": [
+    {
+      "name": "event",
+      "entityType": "tables"
+    },
+    {
+      "name": "inbox",
+      "entityType": "tables"
+    },
+    {
+      "table": "event",
+      "name": "session_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "event",
+      "name": "seq",
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "event",
+      "name": "type",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "event",
+      "name": "data",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "inbox",
+      "name": "id",
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "inbox",
+      "name": "session_id",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "inbox",
+      "name": "text",
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "entityType": "columns"
+    },
+    {
+      "table": "event",
+      "name": "event_pk",
+      "columns": [
+        "session_id",
+        "seq"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    },
+    {
+      "table": "inbox",
+      "name": "inbox_pk",
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "entityType": "pks"
+    }
+  ],
+  "renames": []
+}

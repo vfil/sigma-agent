@@ -57,7 +57,7 @@ A named conversation that survives restarts. It is identified by a session id, a
 _Avoid_: Chat, conversation, save file
 
 **Session event**:
-One recorded fact in a session: a prompt, a finished step, a tool result or a failed turn. Always written in full, never just "event", which would be confused with a model event.
+One recorded fact in a session: a prompt, a finished step, a tool result or a failed turn. A prompt is recorded only when it is delivered, not when the user types it. Always written in full, never just "event", which would be confused with a model event.
 _Avoid_: Event log, log entry, record
 
 **Model event**:
@@ -65,9 +65,25 @@ One piece of a model's streamed reply: a piece of text, a finished tool call, or
 _Avoid_: Chunk, delta, stream event
 
 **Resume**:
-On startup, finishing a turn that a previous run left unfinished.
+On startup, finishing a turn that a previous run left unfinished. Queued prompts from the earlier run wait until this is done.
 _Avoid_: Recover, replay, restore
 
 **Interrupted tool call**:
 A tool call that has no recorded result when a session resumes. It is never run again: it gets an error result saying it may or may not have run.
 _Avoid_: Pending call, orphaned call
+
+**Inbox**:
+The prompts a session has accepted and not yet run. They survive a restart.
+_Avoid_: Queue, buffer, backlog
+
+**Admit**:
+To save a prompt in the inbox. From that moment it survives a restart, whether or not the model has seen it.
+_Avoid_: Enqueue, submit, store
+
+**Deliver**:
+To move the oldest prompt from the inbox into the session as a prompt event, all at once or not at all. Delivering a prompt starts its turn.
+_Avoid_: Dequeue, dispatch, run
+
+**Queued prompt**:
+A prompt that has been admitted and not yet delivered. It is the word the program prints (`[queued]`).
+_Avoid_: Pending prompt, waiting prompt

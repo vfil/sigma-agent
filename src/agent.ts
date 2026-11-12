@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Effect, Queue, Stream } from "effect"
 import { messageOf, type InputClosed, type ProviderError, type SessionCorrupt } from "./errors"
 import type { FinishReason } from "./events"
 import { unansweredCalls } from "./history"
@@ -69,14 +69,6 @@ const run = Effect.gen(function* () {
   }
 })
 
-// One prompt: record it, then run steps until the turn is over.
-export const turn = (input: string) =>
-  Effect.gen(function* () {
-    const session = yield* Session
-    yield* session.append({ type: "prompt", text: input })
-    yield* run
-  })
-
 const interrupted =
   "The agent stopped before this tool finished, so it may or may not have run. Check the current state before repeating it."
 
@@ -99,8 +91,12 @@ const resume = Effect.gen(function* () {
   yield* run
 })
 
-// The read-eval-print loop: finish an interrupted turn, then read a line from the user, run a turn on it,
-// print the output, and repeat.
+const queued = (count: number) => `${count} queued prompt${count === 1 ? "" : "s"}`
+
+// The read-eval-print loop, in two halves that do not wait for each other.
+// - The reader asks for a line, saves it in the inbox, and asks again, even while a turn is running.
+// - The worker finishes an interrupted turn, then delivers one prompt at a time and runs its turn.
+// The reader rings a bell after each prompt. The ring carries no prompt: it only tells the worker to look at the inbox.
 export const repl = Effect.gen(function* () {
   const terminal = yield* Terminal
   const session = yield* Session
@@ -114,9 +110,37 @@ export const repl = Effect.gen(function* () {
       Effect.catchDefect((defect) => failed("bug", messageOf(defect))),
     )
 
+  // At most one ring waits at a time: two rings in a row mean the same thing as one.
+  const wake = yield* Queue.dropping<void>(1)
+  let inputEnded = false
+
+  const reader = Effect.gen(function* () {
+    while (true) {
+      const input = yield* terminal.ask("You: ")
+      yield* session.admit(input)
+      yield* terminal.say("[queued]")
+      yield* Queue.offer(wake, undefined)
+    }
+  }).pipe(
+    Effect.catchTag("InputClosed", () => Effect.sync(() => void (inputEnded = true))),
+    Effect.andThen(Queue.offer(wake, undefined)),
+  )
+
+  // What the last run left in the inbox, counted before the reader can add anything.
+  const left = yield* session.pending
+  if (left > 0) yield* terminal.say(`[${queued(left)} from an earlier run]`)
+
+  yield* Effect.forkChild(reader)
   yield* guarded(resume)
+
   while (true) {
-    const input = yield* terminal.ask("You: ")
-    yield* guarded(turn(input))
+    // Read before delivering: a prompt admitted before the input ended is then always found by the delivery below.
+    const ended = inputEnded
+    if ((yield* session.deliver) !== undefined) {
+      yield* guarded(run)
+      continue
+    }
+    if (ended) return
+    yield* Queue.take(wake)
   }
-}).pipe(Effect.catchTag("InputClosed", () => Effect.void))
+})

@@ -23,7 +23,8 @@ export const callTool = (id: string, name: string, input: unknown): Step => [
 export const fail = (reason: string): Step => [new ProviderError({ reason })]
 
 // A model that follows a script and records the history it was given at each step.
-export const scriptedModel = (steps: Step[]) => {
+// `beforeStep` runs when a step starts and holds the stream back until its promise settles.
+export const scriptedModel = (steps: Step[], beforeStep?: (request: number) => Promise<void>) => {
   const requests: Message[][] = []
   const layer = Layer.succeed(
     ModelClient,
@@ -31,22 +32,28 @@ export const scriptedModel = (steps: Step[]) => {
       chat: (history) =>
         Stream.suspend(() => {
           requests.push([...history])
-          const next = steps[requests.length - 1] ?? fail("The script has no reply left for this step")
-          return Stream.fromIterable(next).pipe(
+          const request = requests.length
+          const next = steps[request - 1] ?? fail("The script has no reply left for this step")
+          const events = Stream.fromIterable(next).pipe(
             Stream.mapEffect((item) => (item instanceof ProviderError ? Effect.fail(item) : Effect.succeed(item))),
           )
+          return beforeStep ? Stream.unwrap(Effect.promise(() => beforeStep(request)).pipe(Effect.as(events))) : events
         }),
     }),
   )
   return { layer, requests }
 }
 
-// A terminal where the user types the given answers, in order. When they run out, input ends.
+// A terminal where the user types the given answers, in order. An answer can be a promise, for a line the user types later.
+// When the answers run out, input ends.
+// Questions that start with "Allow" are answered from `confirmations` instead, so a confirmation reaches the
+// tool that asked even though the reader has already taken every prompt, as the live terminal does.
 // `output` holds the finished lines; `writes` holds every piece passed to `write`, in order.
-export const scriptedTerminal = (answers: string[]) => {
+export const scriptedTerminal = (answers: Array<string | Promise<string>>, confirmations: string[] = []) => {
   const output: string[] = []
   const writes: string[] = []
   const queue = [...answers]
+  const confirm = [...confirmations]
   let pending = "" // text written since the last line ended
   const layer = Layer.succeed(
     Terminal,
@@ -55,8 +62,9 @@ export const scriptedTerminal = (answers: string[]) => {
         Effect.suspend(() => {
           output.push(pending + prompt)
           pending = ""
-          const next = queue.shift()
-          return next === undefined ? Effect.fail(new InputClosed()) : Effect.succeed(next)
+          const next = (prompt.startsWith("Allow") ? confirm : queue).shift()
+          if (next === undefined) return Effect.fail(new InputClosed())
+          return typeof next === "string" ? Effect.succeed(next) : Effect.promise(() => next)
         }),
       say: (line) =>
         Effect.sync(() => {

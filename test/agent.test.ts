@@ -23,9 +23,14 @@ const deleteEverything = defineTool({
 })
 
 // Runs the loop against a script, on a session kept in memory, and returns what the loop and the fakes saw.
-const run = async (script: { model: Step[]; answers: string[] }) => {
-  const model = scriptedModel(script.model)
-  const terminal = scriptedTerminal(script.answers)
+const run = async (script: {
+  model: Step[]
+  answers: Array<string | Promise<string>>
+  confirmations?: string[]
+  beforeStep?: (request: number) => Promise<void>
+}) => {
+  const model = scriptedModel(script.model, script.beforeStep)
+  const terminal = scriptedTerminal(script.answers, script.confirmations)
   const layers = Layer.mergeAll(model.layer, terminal.layer, Layer.succeed(Tools, [echo, deleteEverything]), SessionLive({ path: ":memory:", id: "test" }))
 
   const { history, events } = await Effect.runPromise(
@@ -50,32 +55,32 @@ describe("the agent loop", () => {
     expect(output).toContain("Agent: The tool said hi.")
   })
 
-  test("tells the model when the user declines", async () => {
-    const { requests } = await run({
-      model: [callTool("call_1", "delete_everything", {}), reply("Understood, I will not delete anything.")],
-      answers: ["clean up", "n"],
+  test("appends each fact to the log as it happens", async () => {
+    const { events } = await run({
+      model: [callTool("call_1", "echo", { text: "hi" }), reply("The tool said hi.")],
+      answers: ["say hi"],
     })
 
-    // The second request is the step after the tool call: its last message holds the result.
-    const result = requests[1]?.at(-1)?.content[0]
-    expect(result).toMatchObject({ type: "tool-result", result: { type: "error" } })
-    expect(JSON.stringify(result)).toContain("User declined")
-  })
-
-  test("drops a turn whose model call fails", async () => {
-    const { history, output } = await run({
-      model: [fail("connection refused")],
-      answers: ["hello"],
-    })
-
-    expect(history).toEqual([])
-    expect(output).toContain("[provider error] connection refused")
+    expect(events.map((event) => event.type)).toEqual(["prompt", "step-finished", "tool-result", "step-finished"])
   })
 
   test("shows the reply piece by piece", async () => {
     const { writes } = await run({ model: [reply("Hello there, friend.")], answers: ["hi"] })
 
     expect(writes).toEqual(["Agent: ", "Hello ", "there, ", "friend."])
+  })
+
+  test("tells the model when the user declines", async () => {
+    const { requests } = await run({
+      model: [callTool("call_1", "delete_everything", {}), reply("Understood, I will not delete anything.")],
+      answers: ["clean up"],
+      confirmations: ["n"],
+    })
+
+    // The second request is the step after the tool call: its last message holds the result.
+    const result = requests[1]?.at(-1)?.content[0]
+    expect(result).toMatchObject({ type: "tool-result", result: { type: "error" } })
+    expect(JSON.stringify(result)).toContain("User declined")
   })
 
   test("ends the line of a reply that breaks off, then drops the turn", async () => {
@@ -90,12 +95,48 @@ describe("the agent loop", () => {
     expect(output).toContain("[provider error] connection reset")
   })
 
-  test("appends each fact to the log as it happens", async () => {
-    const { events } = await run({
-      model: [callTool("call_1", "echo", { text: "hi" }), reply("The tool said hi.")],
-      answers: ["say hi"],
+  test("drops a turn whose model call fails", async () => {
+    const { history, output } = await run({
+      model: [fail("connection refused")],
+      answers: ["hello"],
     })
 
-    expect(events.map((event) => event.type)).toEqual(["prompt", "step-finished", "tool-result", "step-finished"])
+    expect(history).toEqual([])
+    expect(output).toContain("[provider error] connection refused")
+  })
+
+  test("saves every prompt first, then runs them one at a time in the order they came", async () => {
+    const { events, requests, output } = await run({
+      model: [reply("First."), reply("Second."), reply("Third.")],
+      answers: ["one", "two", "three"],
+    })
+
+    expect(output.filter((line) => line === "[queued]")).toHaveLength(3)
+    expect(events.map((event) => (event.type === "prompt" ? event.text : event.type))).toEqual([
+      "one", "step-finished", "two", "step-finished", "three", "step-finished",
+    ])
+    expect(requests[2]?.map((message) => message.role)).toEqual(["user", "assistant", "user", "assistant", "user"])
+  })
+
+  test("a prompt typed while a turn runs is saved at once and runs after the turn", async () => {
+    let typeSecond!: (line: string) => void
+    const second = new Promise<string>((resolve) => (typeSecond = resolve))
+
+    const { events, output } = await run({
+      model: [callTool("call_1", "echo", { text: "hi" }), reply("First done."), reply("Second done.")],
+      answers: ["first", second],
+      // The user types while the model is working on the second step of the first turn.
+      beforeStep: async (request) => {
+        if (request !== 2) return
+        typeSecond("second")
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      },
+    })
+
+    expect(output.indexOf("[queued]", output.indexOf("[queued]") + 1)).toBeLessThan(output.indexOf("Agent: First done."))
+    expect(events.map((event) => (event.type === "prompt" ? event.text : event.type))).toEqual([
+      "first", "step-finished", "tool-result", "step-finished", "second", "step-finished",
+    ])
+    expect(output).toContain("Agent: Second done.")
   })
 })

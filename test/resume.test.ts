@@ -36,12 +36,13 @@ const result = (id: string): SessionEvent => ({
   part: { type: "tool-result", id, name: "echo", result: { type: "text", value: id } },
 })
 
-// Process one: the events that were written before the crash.
-const crashAfter = (events: SessionEvent[]) =>
+// Process one: the events that were written before the crash, and the prompts that were still in the inbox.
+const crashAfter = (events: SessionEvent[], inbox: string[] = []) =>
   Effect.runPromise(
     Effect.gen(function* () {
       const session = yield* Session
       for (const event of events) yield* session.append(event)
+      for (const text of inbox) yield* session.admit(text)
     }).pipe(Effect.provide(SessionLive({ path: join(dir, "agent.db"), id: "s" }))),
   )
 
@@ -120,5 +121,32 @@ describe("resuming a session", () => {
     await restart([callTool("c9", "echo", { text: "again" }), reply("Done.")])
 
     expect(ran).toEqual(["again"])
+  })
+
+  test("runs the prompts that were still in the inbox, in order", async () => {
+    await crashAfter([], ["one", "two"])
+
+    const { events, output } = await restart([reply("A."), reply("B.")])
+
+    expect(output).toContain("[2 queued prompts from an earlier run]")
+    expect(events.map((event) => (event.type === "prompt" ? event.text : event.type))).toEqual(["one", "step-finished", "two", "step-finished"])
+  })
+
+  test("finishes the interrupted turn before it delivers the next prompt", async () => {
+    await crashAfter([prompt("first")], ["second"])
+
+    const { events, requests, output } = await restart([reply("A."), reply("B.")])
+
+    expect(output.slice(0, 2)).toEqual(["[1 queued prompt from an earlier run]", "[resuming session s]"])
+    expect(requests[0]?.map((message) => message.role)).toEqual(["user"])
+    expect(events.map((event) => (event.type === "prompt" ? event.text : event.type))).toEqual(["first", "step-finished", "second", "step-finished"])
+  })
+
+  test("says nothing about the inbox when it is empty", async () => {
+    await crashAfter([prompt("hi"), { type: "step-finished", message: { role: "assistant", content: [{ type: "text", text: "Hello." }] }, finish: "stop" }])
+
+    const { output } = await restart([])
+
+    expect(output.join("\n")).not.toContain("queued prompt")
   })
 })
