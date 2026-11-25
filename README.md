@@ -2,7 +2,7 @@
 
 A small coding-agent in a handful of files, written to show how an LLM agent works. [Effect](https://effect.website) is the core dependency. The session log adds SQLite through `drizzle-orm` and `@effect/sql-sqlite-bun`.
 
-You chat with it in the terminal, and the reply appears as the model writes it. The model can't touch your files directly. It can only ask the program to run one of five **tools** (see [GLOSSARY.md](GLOSSARY.md) for the terms used here), and the program runs the tool and feeds the result back. Tools that change things ask you to confirm first.
+You chat with it in the terminal, and the reply appears as the model writes it. The model never touches your files itself: it asks the program to run one of five **tools** (see [GLOSSARY.md](GLOSSARY.md) for the terms used here), and the program runs the tool and feeds the result back. Tools that change things ask you to confirm first.
 
 | Tool         | What it does                                                                                              | Confirms first? |
 | ------------ | --------------------------------------------------------------------------------------------------------- | --------------- |
@@ -23,6 +23,7 @@ reader, always asking "You: ", even while a turn runs:
 worker, one turn at a time:
   deliver the oldest queued prompt: it moves from the inbox into the session as a `prompt` event
       rebuild the history from the session's events
+      if the request would come close to the context window, compact first (see Compaction below)
       the protocol encodes the full history + tool definitions, and sends them to the provider, asking for a stream
         the protocol decodes the stream into model events: pieces of text, finished tool calls, and a final "finish"
         ├─ text pieces                     ─► print "Agent: ..." piece by piece as they arrive
@@ -37,9 +38,9 @@ worker, one turn at a time:
 One prompt and everything the agent does in answer to it is a **turn**. Failures are typed errors (see [src/errors.ts](src/errors.ts)), and the loop handles each kind in one place:
 
 - **Tool failures** (unknown tool, invalid arguments, a declined confirmation, a command timeout, a missing file) are sent back to the model as an error result, so it can read the message and try something else.
-- **Provider errors** (server unreachable, a non-OK status, a stream that breaks off, ends before the model finished, or can't be read) are printed as `[provider error] ...` for you only. The model never sees them.
+- **Provider errors** (server unreachable, a non-OK status, a stream that breaks off, ends before the model finished, or can't be read, and an empty summary during compaction) are printed as `[provider error] ...` for you only. The model never sees them.
 - **Bugs** in the program are printed as `[bug] ...`.
-- **Config errors** (an unknown `PROVIDER`, a missing `ANTHROPIC_API_KEY`) are raised when the model client is built, before the first prompt. The program prints the message and exits with code 1.
+- **Config errors** (an unknown `PROVIDER`, a missing `ANTHROPIC_API_KEY`, a `CONTEXT_WINDOW` that is not a whole number) are raised when the model client is built, before the first prompt. The program prints the message and exits with code 1.
 - **Session errors** (a stored session event that no longer matches the schema, for example after a hand edit or a change of version) name the session and the event, and the program exits with code 1 like a config error. Unlike a config error, this can also happen in the middle of a session, because the history is read from the log before every step.
 
 After a provider error or a bug the turn is recorded as failed and the agent moves on to the next queued prompt, or waits for one. The log keeps the failed turn, but the history leaves it out, so the next prompt starts from a consistent conversation. If the error hits in the middle of a reply, the text already printed stays on screen, the line is ended, and then the error is printed.
@@ -57,7 +58,7 @@ The loop in [src/agent.ts](src/agent.ts) does not import readline, `fetch`, SQLi
 
 | Service       | What the loop needs from it                                | Real layer        | Defined in                                 |
 | ------------- | ---------------------------------------------------------- | ----------------- | ------------------------------------------ |
-| `ModelClient` | `chat(history, tools)`: one model call, as a stream of model events | `ModelClientLive` | [src/model-client.ts](src/model-client.ts) |
+| `ModelClient` | `chat(history, tools)`: one model call, as a stream of model events; `contextWindow`: how many tokens the model takes in for one step | `ModelClientLive` | [src/model-client.ts](src/model-client.ts) |
 | `Terminal`    | `ask(prompt)` to read a line, `say(line)` to print one, `write(text)` to print without ending the line | `TerminalLive`    | [src/terminal.ts](src/terminal.ts)         |
 | `Tools`       | the list of tools the model may call                       | `ToolsLive`       | [src/tools.ts](src/tools.ts)               |
 | `Session`     | `admit(text)` to save a prompt in the inbox, `deliver` to move the oldest one into the log, `pending` to count the queued prompts, `append(event)` to record a session event, `events` and `history` to read them back (each call reads the log again) | `SessionLive`     | [src/session.ts](src/session.ts)           |
@@ -74,17 +75,41 @@ A **session** is a named conversation that survives restarts. It is stored as an
 | `step-finished` | a model call ends: the whole assistant message and why it ended         |
 | `tool-result`   | one tool call finishes (a step with three calls records three, one by one) |
 | `turn-failed`   | a provider error or a bug ends the turn; the history leaves that turn out |
+| `compacted`     | a compaction wrote a summary; the history starts from it (see Compaction) |
 
-**Resume.** If the process dies in the middle of a turn, the next start finds a turn that did not finish. It prints `[resuming session ...]`, gives every tool call that has no result an error result saying it may or may not have run (`[interrupted] ...`), and then continues the turn. Such a call is never run again, because a command that already ran must not run twice. The model reads the error result and can check the state before repeating the call.
+### Resume
 
-**Typing while the agent works.** The loop has two halves that do not wait for each other. The reader asks for a line, **admits** it (saves it in the **inbox**, a second table next to the log), prints `[queued]` and asks again, even while a turn is running. The worker runs one turn at a time. When a turn ends it **delivers** the oldest queued prompt. Delivering deletes the inbox row and writes the `prompt` event in one transaction, so a crash cannot lose a prompt or deliver it twice. The reader never sends the prompt to the worker: it only rings a bell, and the worker looks in the inbox. A prompt you type in the middle of a turn is saved at once and runs after the turn, in the order you typed them.
+If the process dies in the middle of a turn, the next start finds a turn that did not finish. It prints `[resuming session ...]`, gives every tool call that has no result an error result saying it may or may not have run (`[interrupted] ...`), and then continues the turn. Such a call is never run again, because a command that already ran must not run twice. The model reads the error result and can check the state before repeating the call.
+
+### Typing while the agent works
+
+The loop has two halves that do not wait for each other. The reader asks for a line, **admits** it (saves it in the **inbox**, a second table next to the log), prints `[queued]` and asks again, even while a turn is running. The worker runs one turn at a time. When a turn ends it **delivers** the oldest queued prompt. Delivering deletes the inbox row and writes the `prompt` event in one transaction, so a crash cannot lose a prompt or deliver it twice. The reader never sends the prompt to the worker: it only rings a bell, and the worker looks in the inbox. A prompt you type in the middle of a turn is saved at once and runs after the turn, in the order you typed them.
 
 The inbox survives a restart. On start, if the last run left queued prompts, the agent prints `[N queued prompts from an earlier run]`. It finishes any interrupted turn first (see Resume), then runs the queued prompts in order. When input ends (`Ctrl+D`), the agent still runs every queued prompt before it exits.
 
-**Where it lives.** The database is a SQLite file. The agent starts in `playground/`, so the default `../my-agent.db` puts it next to the project, outside the folder the agent works in. The file is git-ignored. Two env vars choose the file and the session:
+### Where it lives
+
+The database is a SQLite file. The agent starts in `playground/`, so the default `../my-agent.db` puts it next to the project, outside the folder the agent works in. The file is git-ignored. Two env vars choose the file and the session:
 
 - `DB_PATH`: the database file (default `../my-agent.db`).
 - `SESSION`: the session id (default `default`). A new id starts an empty conversation in the same file, and the old one stays there.
+
+## Compaction
+
+The log only grows, while a model takes in a limited number of tokens per step, its **context window**. Before every step, [src/compaction.ts](src/compaction.ts) estimates the request (the history and the tool definitions, at about four characters per token). From three quarters of the window on, it **compacts** first. The last quarter is left free for the reply.
+
+Compacting is one extra model call. The history goes out as one plain-text transcript, with each tool input and tool result clipped to its first 2,000 characters, followed by instructions to write a **summary** under fixed headings (objective, decisions, work state, next move, relevant files, the latest request word for word). The call carries no tools, because some providers refuse tool calls and results in a request that defines none. The summary is appended as a `compacted` session event, and from then on the history starts from it: one user message that marks the summary as a record of the past, followed by whatever came after it. The events it covers stay in the log. A compaction can happen in the middle of a turn, and the turn then carries on from the summary.
+
+The terminal shows both ends:
+
+```
+[compacting: ~25012 tokens]
+[compacted: 25012 → 812 tokens]
+```
+
+A summary call that fails, or comes back empty, is a provider error: the turn is recorded as failed and nothing is compacted. Right after a compaction the history cannot get any shorter, so the next step goes out as it is, even if it is still over the limit.
+
+Each route has a default window (see Providers). If you started your server with a different context size, set `CONTEXT_WINDOW` to match.
 
 ## Adding a tool
 
@@ -106,13 +131,13 @@ defineTool({
 
 ## Providers
 
-One agent loop, three **providers**. Pick one with the `PROVIDER` env var (default `ollama`):
+The same loop talks to three **providers**. Pick one with the `PROVIDER` env var (default `ollama`):
 
-| `PROVIDER`  | Talks to                       | Protocol                | Default base URL            | Default model       |
-| ----------- | ------------------------------ | ----------------------- | --------------------------- | ------------------- |
-| `ollama`    | Ollama                         | OpenAI Chat Completions | `http://127.0.0.1:11434/v1` | `qwen3.5:9b`        |
-| `llamacpp`  | llama.cpp server               | OpenAI Chat Completions | `http://127.0.0.1:9931/v1`  | `qwen3.5:9b`        |
-| `claude`    | Anthropic API                  | Anthropic Messages      | `https://api.anthropic.com` | `claude-sonnet-5-5` |
+| `PROVIDER`  | Talks to                       | Protocol                | Default base URL            | Default model       | Context window |
+| ----------- | ------------------------------ | ----------------------- | --------------------------- | ------------------- | -------------- |
+| `ollama`    | Ollama                         | OpenAI Chat Completions | `http://127.0.0.1:11434/v1` | `qwen3.5:9b`        | 32,768         |
+| `llamacpp`  | llama.cpp server               | OpenAI Chat Completions | `http://127.0.0.1:9931/v1`  | `qwen3.5:9b`        | 32,768         |
+| `claude`    | Anthropic API                  | Anthropic Messages      | `https://api.anthropic.com` | `claude-sonnet-5-5` | 200,000        |
 
 ```bash
 bun src/index.ts                               # Ollama
@@ -124,7 +149,8 @@ Env vars:
 
 - `PROVIDER`: `ollama`, `llamacpp` or `claude`. Any other value stops the program with the list of valid ones.
 - `ANTHROPIC_API_KEY`: required when `PROVIDER=claude`, ignored otherwise.
-- `BASE_URL`, `MODEL`: override the chosen provider's defaults, whichever provider it is. `ANTHROPIC_BASE_URL` is no longer read; use `BASE_URL` to point `claude` at another endpoint.
+- `BASE_URL`, `MODEL`: override the chosen provider's defaults, whichever provider it is. To point `claude` at another endpoint, set `BASE_URL`; `ANTHROPIC_BASE_URL` is ignored.
+- `CONTEXT_WINDOW`: the model's context window in tokens, overriding the route's default. It must be a whole number (`32768`, not `32k`), or the program stops. Compaction starts from three quarters of it.
 - `DB_PATH`, `SESSION`: the session database file and the session id (see Sessions).
 
 ## Adding a provider
@@ -132,7 +158,7 @@ Env vars:
 A **route** binds a **protocol** to one provider's endpoint, headers and model. A server that speaks an existing protocol needs only a new entry in `routes` in [src/provider.ts](src/provider.ts). `routes` is a function of the environment, so the entry goes inside the object it returns:
 
 ```ts
-vllm: { protocol: openaiChat, baseUrl: "http://127.0.0.1:8000/v1", headers: {}, model: "my-model" },
+vllm: { protocol: openaiChat, baseUrl: "http://127.0.0.1:8000/v1", headers: {}, model: "my-model", contextWindow: 32_768 },
 ```
 
 A new wire format needs a new `Protocol` object in [src/protocols.ts](src/protocols.ts) with three members: `path` (the URL path to call), `body` (turns the history and tools into the request body, with streaming turned on) and `events` (turns the stream of server-sent frames into model events: `text-delta`, `tool-call` and a last `finish` with the reason `tool-calls`, `stop` or `refusal`). Then reference it from a route.
@@ -150,7 +176,7 @@ bun run db:generate   # only after changing src/db/schema.ts: writes a new migra
 
 ## Tests
 
-`bun test` runs without a network, a keyboard or a real model. The session tests use a temporary SQLite file. There are eight groups:
+`bun test` runs without a network, a keyboard or a real model. The session tests use a temporary SQLite file. There are nine groups:
 
 - [test/agent.test.ts](test/agent.test.ts) runs the agent loop against a scripted model and a scripted terminal, with two small in-memory tools. The fakes live in [test/fakes.ts](test/fakes.ts) and are provided as layers in place of the real services. It covers:
   - a tool call followed by a final answer
@@ -161,25 +187,26 @@ bun run db:generate   # only after changing src/db/schema.ts: writes a new migra
   - every prompt saved first and then run one at a time, in the order typed
   - a prompt typed while a turn runs being saved at once and run after that turn
 - [test/protocols.test.ts](test/protocols.test.ts) feeds recorded streams from [test/fixtures/](test/fixtures/) (Ollama, llama.cpp and Claude) through the framing and each protocol. It checks the events, that a tool call sent in fragments comes out as one `tool-call` event, and that the result does not depend on where the bytes are cut.
-- [test/provider.test.ts](test/provider.test.ts) runs one step against a small local HTTP server: the request asks for a stream, and a stream that stops early, a frame that isn't JSON, an error status and an unreachable server each fail with a `ProviderError`.
-- [test/history.test.ts](test/history.test.ts) checks that session events become messages in order, that a failed turn is left out, and which tool calls still lack a result.
+- [test/provider.test.ts](test/provider.test.ts) runs one step against a small local HTTP server: the request asks for a stream, and a stream that stops early, a frame that isn't JSON, an error status and an unreachable server each fail with a `ProviderError`. It also checks that `CONTEXT_WINDOW` overrides the route's window and that a value like `32k` is refused.
+- [test/history.test.ts](test/history.test.ts) checks that session events become messages in order, that a failed turn is left out, and which tool calls still lack a result. After a compaction, it checks that the history starts from the latest summary, that a turn failing after the summary is cut back to the summary, and that a turn starting after it is cut back to its own prompt.
 - [test/session.test.ts](test/session.test.ts) checks that events read back in order after the file is closed and reopened, that two sessions stay apart, and that a stored event that does not match the schema is named.
 - [test/inbox.test.ts](test/inbox.test.ts) checks that prompts are delivered in the order they were admitted, that delivering moves a prompt from the inbox into the log, that the inbox survives closing and reopening the file, that two sessions keep separate inboxes, and that a delivery that fails leaves the prompt in the inbox.
-- [test/lines.test.ts](test/lines.test.ts) checks `makeLines` ([src/lines.ts](src/lines.ts)): lines that arrive early are kept in order, a waiting question gets the line, the newest of several questions gets it, open questions fail when input ends, and an interrupted question does not take the next line. The live terminal does not use it yet.
-- [test/resume.test.ts](test/resume.test.ts) writes the log a crash would leave, starts the agent again on it, and checks that an unanswered call gets an error result and is never run again, that finished and failed turns are left alone, and that queued prompts left by the crash run in order, after the interrupted turn.
+- [test/lines.test.ts](test/lines.test.ts) checks `makeLines` ([src/lines.ts](src/lines.ts)), which the live terminal uses: lines that arrive early are kept in order, a waiting question gets the line, the newest of several questions gets it, open questions fail when input ends, and an interrupted question does not take the next line.
+- [test/resume.test.ts](test/resume.test.ts) writes the log a crash would leave, starts the agent again on it, and checks that an unanswered call gets an error result and is never run again, that finished and failed turns are left alone, and that queued prompts left by the crash run in order, after the interrupted turn. It also covers a crash right after a compaction: the turn continues from the summary, a history that is only a summary is not summarized again, and a turn that failed after a compaction is left alone.
+- [test/compaction.test.ts](test/compaction.test.ts) checks the estimate (about four characters per token, tools included), that compaction is due from three quarters of the window, and that the transcript clips long tool inputs and results. Against a scripted model with a small window, it checks that the history is summarized and the next step starts from the summary alone, that a history that fits is left alone, and that a summary call that fails or comes back empty fails the turn without compacting.
 
 They do not cover a real model or the built-in tools.
 
 ## Try it (manual smoke test)
 
-The tests do not exercise a real model. To check the agent works end to end, run it against the [playground/](playground/) folder, which contains a riddle in `secret-file.txt`.
+To check the agent end to end with a real model, run it against the [playground/](playground/) folder, which contains a riddle in `secret-file.txt`.
 
 > **Warning:** the tools are not sandboxed. Paths are resolved against the directory you launch from and absolute paths work. `bash` can run any command as your user, and `edit_file` and `write_file` can create or overwrite any file you can write. The only protection is the confirmation prompt, so read the path or command it shows before typing `y`. Always run the agent from `playground/`, not from a directory you care about.
 
 1. Make sure a model is available:
-   - **`ollama`** (default): start Ollama and pull the model (`ollama pull qwen3.5:9b`).
-   - **`llamacpp`**: start your llama.cpp server on port `9931`.
-   - **`claude`**: `export ANTHROPIC_API_KEY=...`
+   - `ollama` (default): start Ollama and pull the model (`ollama pull qwen3.5:9b`).
+   - `llamacpp`: start your llama.cpp server on port `9931`.
+   - `claude`: `export ANTHROPIC_API_KEY=...`
 2. Start the agent from inside `playground/`:
 
    ```bash
@@ -207,7 +234,7 @@ The tests do not exercise a real model. To check the agent works end to end, run
    Classic riddle!
    ```
 
-**What to look for:** the `[tool] ...` lines show the model chose to list the directory and then read the file before answering. Exact wording varies between runs and models. What matters is that tool calls happen and the answer is "a keyboard".
+The `[tool] ...` lines show that the model listed the directory and read the file before answering. The wording changes between runs and models; the run passes if the tool calls appear and the answer is "a keyboard".
 
 You can also try a tool that changes things, for example *"add 'call mom' to notes/todo.txt"*. The agent stops and asks before it edits:
 
@@ -220,17 +247,26 @@ Type `y` to let it run. Anything else declines, and the model is told so and can
 
 Press `Ctrl+C` to quit. Ending the input with `Ctrl+D` also exits cleanly.
 
-To check that the session survives a restart, quit, start the agent again with the same command, and ask *"what did I just ask you?"*. The model answers from the stored history. To see the inbox, type a second prompt while the agent is still answering the first: it prints `[queued]` at once and runs after the first turn ends. Set `SESSION=other` to start a fresh conversation. The database is `my-agent.db` in the project root (git-ignored); delete it to forget everything.
+A few more things to try:
+
+- Quit, start the agent again with the same command, and ask *"what did I just ask you?"*. The model answers from the stored session.
+- Type a second prompt while the agent is still answering the first. It prints `[queued]` at once and runs the prompt after the first turn ends.
+- Start with a small window, for example `CONTEXT_WINDOW=3000`, and ask the agent to read a few files. It prints `[compacting: ...]` before the step that would go over, so you see a compaction without filling 32k tokens.
+- Set `SESSION=other` for a fresh conversation.
+
+The database is `my-agent.db` in the project root (git-ignored). Delete it to forget everything.
 
 ## Known limitations
 
 - No sandboxing.
 - One process per session. The sequence number of the events is counted in memory, so two processes on the same `SESSION` would collide. The inbox ids come from the database, but a second writer still makes `deliver` fail, and the prompt stays in the inbox when it does.
-- A queued prompt cannot be cancelled, edited or listed, and a running turn cannot be interrupted. You can only wait for it.
+- A queued prompt cannot be cancelled, edited or listed, and a running turn cannot be interrupted.
 - `Ctrl+D` does not exit at once: the agent runs every queued prompt first. `Ctrl+C` leaves the queued prompts in the inbox, and the next start runs them.
-- The live terminal still reads one line at a time with readline, while the reader is always asking `You: `. A confirmation (`Allow: ...? [y/N]`) asked during a turn is a second open question. [src/lines.ts](src/lines.ts) is the module meant to settle which question gets a typed line (the newest one), but `TerminalLive` does not use it yet, so confirming while a prompt is being read may not work.
 - No way to list, switch or delete sessions from inside the agent. You pick one with `SESSION` when you launch it.
-- The log only grows, and the whole history is sent on every call. There is no compaction.
+- The token estimate is rough (about four characters per token), so a request can still go over the context window.
+- A summary loses detail. Tool inputs and results longer than 2,000 characters are clipped before the model summarizes them.
+- If a turn fails after a compaction in the middle of it, the history goes back to the summary. The turn's own prompt survives only as the summary's "latest request".
+- If the summary alone is still over the window, the step is sent anyway. The agent never compacts twice in a row.
 - A turn that fails with a provider error or a bug is left out of the history, including any tool calls it already ran. If the model had already edited a file or run a command before the failure, that change stays on disk but the model no longer remembers making it.
 - A tool call interrupted by a crash is never run again. The model is told it may or may not have run, so it has to check the result itself.
 - Confirmation covers only `edit_file`, `write_file` and `bash`. `read_file` and `list_files` can read any path without asking, and the prompt shows only the path or command, not the file content or a diff.
@@ -238,24 +274,25 @@ To check that the session survives a restart, quit, start the agent again with t
 ## Repo layout
 
 - [src/index.ts](src/index.ts): the entry point: wires the live layers together, runs the loop and reports config errors
-- [src/agent.ts](src/agent.ts): the agent loop (`run`, the steps of one turn; `step`, one model call, which prints the text as it arrives and records the assistant message), `resume` for an unfinished turn, and the `repl`, made of a reader that admits prompts and a worker that delivers them and runs their turns, and handles provider errors and bugs
+- [src/agent.ts](src/agent.ts): the agent loop (`run`, the steps of one turn; `step`, one model call, which prints the text as it arrives and records the assistant message; each step is preceded by `compactIfDue`), `resume` for an unfinished turn, and the `repl`, made of a reader that admits prompts and a worker that delivers them and runs their turns, and handles provider errors and bugs
 - [src/events.ts](src/events.ts): the model events a step streams
 - [src/sse.ts](src/sse.ts): cuts a byte stream into server-sent events
 - [src/model-client.ts](src/model-client.ts): the `ModelClient` service and its live layer
 - [src/messages.ts](src/messages.ts): the protocol-neutral message types, as Schemas so the same definitions check what is read back from the log
 - [src/session.ts](src/session.ts): the `Session` service (inbox and log) and its live SQLite layer
-- [src/session-event.ts](src/session-event.ts): the four kinds of session event
+- [src/session-event.ts](src/session-event.ts): the five kinds of session event
 - [src/db/schema.ts](src/db/schema.ts): the two database tables, the event log and the inbox (the Drizzle schema)
-- [src/lines.ts](src/lines.ts): `makeLines`, which hands typed lines to the open questions (not used by the live terminal yet)
+- [src/lines.ts](src/lines.ts): `makeLines`, which hands each typed line to the newest open question
+- [src/compaction.ts](src/compaction.ts): the token estimate, the summary request and `compactIfDue`, which runs before every step
 - [src/history.ts](src/history.ts): rebuilds the history from session events (`toHistory`) and finds the tool calls an unfinished turn left without a result (`unansweredCalls`)
 - [drizzle/](drizzle/): the database migrations, applied when the session opens
 - [src/tool.ts](src/tool.ts): `defineTool`, `runTool` and the `Tools` service
 - [src/tools.ts](src/tools.ts): the five tools and `ToolsLive`
 - [src/protocols.ts](src/protocols.ts): the OpenAI Chat Completions and Anthropic Messages protocols, each turning stream frames into model events
-- [src/provider.ts](src/provider.ts): the routes, provider selection from env vars (`selectRoute`), and the model call (a stream of events; it fails if the stream ends before a `finish`)
+- [src/provider.ts](src/provider.ts): the routes with their context windows, provider selection from env vars (`selectRoute`), and the model call (a stream of events; it fails if the stream ends before a `finish`)
 - [src/errors.ts](src/errors.ts): the typed errors (including `SessionCorrupt`)
-- [src/terminal.ts](src/terminal.ts): the `Terminal` service (read a line, print a line, print without ending the line) and its live layer
-- [test/](test/): the loop, protocol, provider, history, session, inbox, lines and resume tests, the fake model and terminal, and recorded streams in `fixtures/`
+- [src/terminal.ts](src/terminal.ts): the `Terminal` service (read a line, print a line, print without ending the line) and its live layer, which uses readline only to cut standard input into lines and lets the terminal echo what you type, so a reply printed while you type does not disturb the line
+- [test/](test/): the loop, protocol, provider, history, session, inbox, lines, resume and compaction tests, the fake model and terminal, and recorded streams in `fixtures/`
 - [GLOSSARY.md](GLOSSARY.md): the project's vocabulary
 - [playground/](playground/): scratch folder to run the agent in
 - `.claude/skills/`: Claude Code dev-workflow skills used when working on this repo. They are not part of the agent and you can ignore them.

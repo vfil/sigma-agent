@@ -24,7 +24,8 @@ export const fail = (reason: string): Step => [new ProviderError({ reason })]
 
 // A model that follows a script and records the history it was given at each step.
 // `beforeStep` runs when a step starts and holds the stream back until its promise settles.
-export const scriptedModel = (steps: Step[], beforeStep?: (request: number) => Promise<void>) => {
+// `contextWindow` is large unless a test sets it, so compaction only happens in the tests that ask for it.
+export const scriptedModel = (steps: Step[], beforeStep?: (request: number) => Promise<void>, contextWindow = 1_000_000) => {
   const requests: Message[][] = []
   const layer = Layer.succeed(
     ModelClient,
@@ -39,6 +40,7 @@ export const scriptedModel = (steps: Step[], beforeStep?: (request: number) => P
           )
           return beforeStep ? Stream.unwrap(Effect.promise(() => beforeStep(request)).pipe(Effect.as(events))) : events
         }),
+      contextWindow,
     }),
   )
   return { layer, requests }

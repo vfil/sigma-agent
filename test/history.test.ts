@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { toHistory, unansweredCalls } from "../src/history"
+import { summaryMessage, toHistory, unansweredCalls } from "../src/history"
 import type { ToolResultPart } from "../src/messages"
 import type { SessionEvent } from "../src/session-event"
 
@@ -19,6 +19,7 @@ const result = (id: string): SessionEvent => {
   return { type: "tool-result", part }
 }
 const failed: SessionEvent = { type: "turn-failed", reason: "connection reset" }
+const compacted = (summary: string): SessionEvent => ({ type: "compacted", summary })
 
 describe("toHistory", () => {
   test("turns events into messages in order", () => {
@@ -38,6 +39,32 @@ describe("toHistory", () => {
     const history = toHistory([prompt("one"), answer("first"), prompt("two"), calls("a"), failed, prompt("three")])
 
     expect(history.map((message) => message.role)).toEqual(["user", "assistant", "user"])
+  })
+})
+
+describe("toHistory after a compaction", () => {
+  test("starts from the latest summary and keeps what came after it", () => {
+    const history = toHistory([prompt("one"), answer("first"), prompt("two"), calls("a"), result("a"), compacted("S1"), answer("second")])
+
+    expect(history).toEqual([summaryMessage("S1"), { role: "assistant", content: [{ type: "text", text: "second" }] }])
+  })
+
+  test("a later summary replaces an earlier one", () => {
+    const history = toHistory([prompt("one"), compacted("S1"), answer("first"), prompt("two"), compacted("S2")])
+
+    expect(history).toEqual([summaryMessage("S2")])
+  })
+
+  test("a turn that fails after a summary is cut back to the summary", () => {
+    const history = toHistory([prompt("go"), calls("a"), result("a"), compacted("S1"), calls("b"), result("b"), failed])
+
+    expect(history).toEqual([summaryMessage("S1")])
+  })
+
+  test("a turn that starts after a summary is cut back to its own prompt", () => {
+    const history = toHistory([prompt("one"), compacted("S1"), answer("first"), prompt("two"), calls("a"), failed])
+
+    expect(history.map((message) => message.role)).toEqual(["user", "assistant"])
   })
 })
 

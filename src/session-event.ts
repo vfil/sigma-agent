@@ -17,5 +17,8 @@ export const ToolResult = Schema.Struct({ type: Schema.Literal("tool-result"), p
 // The turn ended in an error. The history leaves the turn out; the log keeps it.
 export const TurnFailed = Schema.Struct({ type: Schema.Literal("turn-failed"), reason: Schema.String })
 
-export const SessionEvent = Schema.Union([Prompt, StepFinished, ToolResult, TurnFailed])
+// Everything before this point in the history was replaced by a summary. The events it covers stay in the log.
+export const Compacted = Schema.Struct({ type: Schema.Literal("compacted"), summary: Schema.String })
+
+export const SessionEvent = Schema.Union([Prompt, StepFinished, ToolResult, TurnFailed, Compacted])
 export type SessionEvent = typeof SessionEvent.Type

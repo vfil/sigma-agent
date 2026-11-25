@@ -1,7 +1,8 @@
 import { Effect, Queue, Stream } from "effect"
+import { compactIfDue } from "./compaction"
 import { messageOf, type InputClosed, type ProviderError, type SessionCorrupt } from "./errors"
 import type { FinishReason } from "./events"
-import { unansweredCalls } from "./history"
+import { toHistory, unansweredCalls } from "./history"
 import { isToolCall, type Message, type Part } from "./messages"
 import { ModelClient } from "./model-client"
 import { Session } from "./session"
@@ -51,12 +52,14 @@ const step = (tools: Tool[]) =>
   })
 
 // Steps until the model stops asking for tools. Each result is appended as soon as its tool finishes.
+// Before each step, the history is compacted if the request would come close to the context window.
 const run = Effect.gen(function* () {
   const terminal = yield* Terminal
   const session = yield* Session
   const tools = yield* Tools
 
   while (true) {
+    yield* compactIfDue(tools)
     const { message, finish } = yield* step(tools)
     if (finish !== "tool-calls") return
 
@@ -77,7 +80,10 @@ const interrupted =
 const resume = Effect.gen(function* () {
   const terminal = yield* Terminal
   const session = yield* Session
-  const calls = unansweredCalls(yield* session.history)
+  const events = yield* session.events
+  // A failed turn is over. After a compaction its history can end in the summary, which reads like an open turn.
+  if (events.at(-1)?.type === "turn-failed") return
+  const calls = unansweredCalls(toHistory(events))
   if (calls === undefined) return
 
   yield* terminal.say(`[resuming session ${session.id}]`)

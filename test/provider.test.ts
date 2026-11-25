@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Effect, Stream } from "effect"
 import type { ModelEvent } from "../src/events"
 import { openaiChat } from "../src/protocols"
-import { chat, type Route } from "../src/provider"
+import { chat, selectRoute, type Route } from "../src/provider"
 
 const sse = (...lines: string[]) => lines.map((line) => `${line}\n\n`).join("")
 
@@ -12,7 +12,7 @@ const chunk = (delta: object, finish: string | null = null) => `data: ${JSON.str
 // the error message, or an empty string when the step finished.
 const step = async (respond: (request: Request) => Response | Promise<Response>, baseUrl?: string) => {
   const server = Bun.serve({ port: 0, fetch: respond })
-  const route: Route = { protocol: openaiChat, baseUrl: baseUrl ?? `http://127.0.0.1:${server.port}`, headers: {}, model: "test" }
+  const route: Route = { protocol: openaiChat, baseUrl: baseUrl ?? `http://127.0.0.1:${server.port}`, headers: {}, model: "test", contextWindow: 32_768 }
   const events: ModelEvent[] = []
   try {
     const failure = await Effect.runPromise(
@@ -71,5 +71,24 @@ describe("one step over HTTP", () => {
     const { failure } = await step(() => new Response(""), "http://127.0.0.1:1")
 
     expect(failure).toContain("Could not reach")
+  })
+})
+
+describe("the context window", () => {
+  const windowOf = (env: Record<string, string>) =>
+    Effect.runPromise(
+      selectRoute(env).pipe(
+        Effect.map((route) => route.contextWindow),
+        Effect.catchTag("ConfigError", (error) => Effect.succeed(error.message)),
+      ),
+    )
+
+  test("comes from the route unless CONTEXT_WINDOW overrides it", async () => {
+    expect(await windowOf({ PROVIDER: "ollama" })).toBe(32_768)
+    expect(await windowOf({ PROVIDER: "ollama", CONTEXT_WINDOW: "6000" })).toBe(6000)
+  })
+
+  test("refuses a CONTEXT_WINDOW that is not a whole number of tokens", async () => {
+    expect(await windowOf({ CONTEXT_WINDOW: "32k" })).toBe('CONTEXT_WINDOW must be a whole number of tokens, not "32k"')
   })
 })

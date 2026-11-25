@@ -47,8 +47,20 @@ One user prompt and everything the agent does in answer to it, from the first mo
 _Avoid_: Step, iteration, request
 
 **History**:
-The ordered conversation the agent sends to the model on every call, rebuilt from the session's events and leaving out any failed turn.
+The ordered conversation the agent sends to the model on every call, rebuilt from the session's events. It starts from the latest summary, if there is one, and leaves out any failed turn.
 _Avoid_: Messages, context, transcript
+
+**Context window**:
+The most tokens a model takes in for one step, its reply included.
+_Avoid_: Context length, max tokens, limit
+
+**Compaction**:
+Replacing the history so far with a summary the model writes, when the next request would come close to the context window. The session events it covers stay in the session.
+_Avoid_: Truncation, pruning, condensing
+
+**Summary**:
+The text a compaction produces. The history starts from the latest one.
+_Avoid_: Recap, digest
 
 ## Sessions
 
@@ -57,7 +69,7 @@ A named conversation that survives restarts. It is identified by a session id, a
 _Avoid_: Chat, conversation, save file
 
 **Session event**:
-One recorded fact in a session: a prompt, a finished step, a tool result or a failed turn. A prompt is recorded only when it is delivered, not when the user types it. Always written in full, never just "event", which would be confused with a model event.
+One recorded fact in a session: a prompt, a finished step, a tool result, a failed turn or a compaction. A prompt is recorded only when it is delivered, not when the user types it. Always written in full, never just "event", which would be confused with a model event.
 _Avoid_: Event log, log entry, record
 
 **Model event**:

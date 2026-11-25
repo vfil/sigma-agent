@@ -7,6 +7,7 @@ import { repl } from "../src/agent"
 import type { SessionEvent } from "../src/session-event"
 import { Session, SessionLive } from "../src/session"
 import { defineTool, Tools } from "../src/tool"
+import { summaryMessage } from "../src/history"
 import { callTool, reply, scriptedModel, scriptedTerminal } from "./fakes"
 
 // A crash leaves the log as it was at the moment the process died. These tests write that log with
@@ -47,8 +48,8 @@ const crashAfter = (events: SessionEvent[], inbox: string[] = []) =>
   )
 
 // Process two: a new agent on the same file. No input, so it only finishes what it finds.
-const restart = async (modelSteps: Parameters<typeof scriptedModel>[0]) => {
-  const model = scriptedModel(modelSteps)
+const restart = async (modelSteps: Parameters<typeof scriptedModel>[0], contextWindow?: number) => {
+  const model = scriptedModel(modelSteps, undefined, contextWindow)
   const terminal = scriptedTerminal([])
   const layers = Layer.mergeAll(model.layer, terminal.layer, Layer.succeed(Tools, [echo]), SessionLive({ path: join(dir, "agent.db"), id: "s" }))
   const events = await Effect.runPromise(
@@ -148,5 +149,33 @@ describe("resuming a session", () => {
     const { output } = await restart([])
 
     expect(output.join("\n")).not.toContain("queued prompt")
+  })
+
+  test("continues a turn that stopped right after a compaction, from the summary", async () => {
+    await crashAfter([prompt("go"), calls("a"), result("a"), { type: "compacted", summary: "S1" }])
+
+    const { requests, output } = await restart([reply("Done.")])
+
+    expect(output).toContain("[resuming session s]")
+    expect(requests[0]).toEqual([summaryMessage("S1")])
+  })
+
+  test("does not summarize a history that is already only a summary", async () => {
+    await crashAfter([prompt("go"), { type: "compacted", summary: "S1" }])
+
+    // A window of 10 tokens: even the summary is over the limit.
+    const { requests, events } = await restart([reply("Done.")], 10)
+
+    expect(requests).toEqual([[summaryMessage("S1")]])
+    expect(events.map((event) => event.type)).toEqual(["prompt", "compacted", "step-finished"])
+  })
+
+  test("leaves a turn alone that failed after a compaction", async () => {
+    await crashAfter([prompt("go"), calls("a"), result("a"), { type: "compacted", summary: "S1" }, { type: "turn-failed", reason: "connection reset" }])
+
+    const { requests, output } = await restart([])
+
+    expect(requests).toEqual([])
+    expect(output.join("\n")).not.toContain("resuming")
   })
 })

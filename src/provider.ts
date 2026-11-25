@@ -9,27 +9,34 @@ import type { Tool } from "./tool"
 type Env = Record<string, string | undefined>
 
 // A route binds a protocol to one provider's endpoint and authentication.
-export type Route = { protocol: Protocol; baseUrl: string; headers: Record<string, string>; model: string }
+// `contextWindow` is the most tokens the model takes in for one step, the reply included.
+export type Route = { protocol: Protocol; baseUrl: string; headers: Record<string, string>; model: string; contextWindow: number }
 
 // The routes the agent knows. They read the environment they are given, so nothing happens at import time.
+// The two local windows match the 32k context the servers were started with in Part 1.
 const routes = (env: Env): Record<string, Route> => ({
-  ollama: { protocol: openaiChat, baseUrl: "http://127.0.0.1:11434/v1", headers: {}, model: "qwen3.5:9b" },
-  llamacpp: { protocol: openaiChat, baseUrl: "http://127.0.0.1:9931/v1", headers: {}, model: "qwen3.5:9b" },
+  ollama: { protocol: openaiChat, baseUrl: "http://127.0.0.1:11434/v1", headers: {}, model: "qwen3.5:9b", contextWindow: 32_768 },
+  llamacpp: { protocol: openaiChat, baseUrl: "http://127.0.0.1:9931/v1", headers: {}, model: "qwen3.5:9b", contextWindow: 32_768 },
   claude: {
     protocol: anthropicMessages,
     baseUrl: "https://api.anthropic.com",
     headers: { "x-api-key": env.ANTHROPIC_API_KEY ?? "", "anthropic-version": "2026-10-21" },
     model: "claude-sonnet-5-5",
+    contextWindow: 200_000,
   },
 })
 
-// PROVIDER picks the route. BASE_URL and MODEL override the route's defaults.
+// PROVIDER picks the route. BASE_URL, MODEL and CONTEXT_WINDOW override the route's defaults.
 export const selectRoute = (env: Env): Effect.Effect<Route, ConfigError> => {
   const name = env.PROVIDER ?? "ollama"
   const selected = routes(env)[name]
   if (!selected) return Effect.fail(new ConfigError({ reason: `Unknown PROVIDER "${name}". Choose one of: ${Object.keys(routes(env)).join(", ")}` }))
   if (name === "claude" && !env.ANTHROPIC_API_KEY) return Effect.fail(new ConfigError({ reason: "Set ANTHROPIC_API_KEY first" }))
-  return Effect.succeed({ ...selected, baseUrl: env.BASE_URL ?? selected.baseUrl, model: env.MODEL ?? selected.model })
+  const contextWindow = env.CONTEXT_WINDOW === undefined ? selected.contextWindow : Number(env.CONTEXT_WINDOW)
+  if (!Number.isInteger(contextWindow) || contextWindow <= 0) {
+    return Effect.fail(new ConfigError({ reason: `CONTEXT_WINDOW must be a whole number of tokens, not "${env.CONTEXT_WINDOW}"` }))
+  }
+  return Effect.succeed({ ...selected, baseUrl: env.BASE_URL ?? selected.baseUrl, model: env.MODEL ?? selected.model, contextWindow })
 }
 
 // A stream that ends without a finish event was cut off.
